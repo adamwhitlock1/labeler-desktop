@@ -1,0 +1,12 @@
+[package]
+name = "label-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+label-core = { path = "../label-core" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+ab_glyph = "0.2"
+imageproc = "0.27"
+thiserror = "2"

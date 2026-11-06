@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/label-core",
+    "crates/label-render",
+    "crates/label-device",
+    "crates/label-cli",
+    "crates/label-desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+
+[profile.release]
+opt-level = 3
