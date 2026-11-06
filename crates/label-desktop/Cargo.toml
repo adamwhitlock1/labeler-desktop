@@ -12,3 +12,6 @@ path = "src/main.rs"
 label-core = { path = "../label-core" }
 label-render = { path = "../label-render" }
 label-device = { path = "../label-device" }
+gpui-kit = "0.9"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }

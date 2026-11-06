@@ -34,4 +34,6 @@ cat > "$OUT_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+codesign --force --deep --sign - "$OUT_DIR" >/dev/null 2>&1
+
 echo "built $OUT_DIR"

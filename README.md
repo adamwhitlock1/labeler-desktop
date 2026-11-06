@@ -11,8 +11,20 @@ distribution.
   Atkinson), alignment, invert, contrast, pixel-exact preview PNGs. Tested.
 - `label-device` — BLE discovery + connect + print via `btleplug`. **Verified against a
   real LT200B.**
-- `label-cli` — `scan`, `text`, `image`, `preview` subcommands. Working end-to-end.
-- `label-desktop` — GPUI Kit desktop app. In progress.
+- `label-cli` — `scan`, `text`, `image`, `preview` subcommands. **Verified against a real LT200B.**
+- `label-desktop` — GPUI Kit desktop app: scan/select printer, text + image tabs, dithering,
+  alignment, bold/invert/frame, pixel-exact preview, copies, print. **Verified end-to-end
+  against a real LT200B.**
+
+## Toolchain notes
+
+- Pinned to **nightly** Rust (`rust-toolchain.toml`) — `gpui-pre` (pulled in by `gpui-kit`)
+  uses the unstable `cold_path` std feature.
+- First build needs the Metal toolchain for shader compilation: `xcodebuild -downloadComponent
+  MetalToolchain` (one-time, ~840MB).
+- `label-desktop` runs its own background Tokio runtime (see `runtime()` in `main.rs`) because
+  btleplug's macOS CoreBluetooth backend requires an active Tokio reactor for the lifetime of
+  any Bluetooth operation, and GPUI's own async executor isn't Tokio.
 
 ## Protocol credit
 
@@ -44,7 +56,17 @@ cargo build -p label-cli
 ```
 
 The first run prompts for Bluetooth permission (grant it to whatever process launched the
-binary — Terminal, if run from a shell).
+binary — Terminal, if run from a shell). The script also ad-hoc codesigns the bundle
+(`codesign --sign -`); without a valid signature macOS kills the process outright
+(`SIGKILL`, "Code Signature Invalid") once it touches CoreBluetooth.
+
+Same for the desktop app:
+
+```bash
+cargo build -p label-desktop
+./scripts/make_app_bundle.sh label-desktop target/debug/label-desktop LabelDesktop
+./dist/LabelDesktop.app/Contents/MacOS/label-desktop
+```
 
 ## CLI usage
 

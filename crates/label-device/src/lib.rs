@@ -40,7 +40,7 @@ pub async fn scan(timeout: Duration) -> Result<Vec<DiscoveredPrinter>, DeviceErr
     let adapter = adapters.into_iter().next().ok_or(DeviceError::NoAdapter)?;
 
     adapter.start_scan(ScanFilter::default()).await?;
-    tokio::time::sleep(timeout).await;
+    futures_timer::Delay::new(timeout).await;
     let peripherals = adapter.peripherals().await?;
     adapter.stop_scan().await?;
 
@@ -97,7 +97,7 @@ impl Printer {
         // peripherals() only returns previously-seen devices; scan briefly
         // if we haven't seen this one yet.
         adapter.start_scan(ScanFilter::default()).await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        futures_timer::Delay::new(Duration::from_secs(2)).await;
         adapter.stop_scan().await?;
 
         let peripherals = adapter.peripherals().await?;
@@ -178,13 +178,15 @@ mod tests {
     use super::*;
     use label_core::{create_job, Raster};
 
-    #[tokio::test]
-    async fn print_job_writes_every_chunk_in_order() {
-        let raster = Raster::new(32, 4, vec![false; 32 * 4]);
-        let job = create_job(&raster);
-        let mut transport = RecordingTransport::default();
-        print_job(&mut transport, &job).await.unwrap();
-        assert_eq!(transport.writes.len(), job.len());
-        assert_eq!(transport.writes, job);
+    #[test]
+    fn print_job_writes_every_chunk_in_order() {
+        pollster::block_on(async {
+            let raster = Raster::new(32, 4, vec![false; 32 * 4]);
+            let job = create_job(&raster);
+            let mut transport = RecordingTransport::default();
+            print_job(&mut transport, &job).await.unwrap();
+            assert_eq!(transport.writes.len(), job.len());
+            assert_eq!(transport.writes, job);
+        });
     }
 }
