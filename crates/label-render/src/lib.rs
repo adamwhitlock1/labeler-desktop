@@ -143,21 +143,30 @@ pub fn raster_from_text(
     let max_width = widths.iter().copied().max().unwrap_or(1).max(1);
     let total_height = line_height * lines.len().max(1) as i32;
 
+    // The whole canvas's narrow (height) dimension gets stretched to
+    // exactly fill the print head's cross-feed dots after rotation, so
+    // anything drawn on the canvas's own edge lands on the printer's
+    // outermost dots. Thermal print heads commonly don't reliably mark
+    // those (tape-width tolerance margin), which clips a frame drawn
+    // flush with the edge. `frame_margin` keeps the frame — and really
+    // all content — a few dots in from the absolute edge.
+    let frame_margin = if text_opts.frame { 3 } else { 0 };
     let pad = if text_opts.frame { 4 } else { 0 };
+    let outer = pad + frame_margin;
     let mut canvas = GrayImage::from_pixel(
-        (max_width + pad * 2) as u32,
-        (total_height + pad * 2) as u32,
+        (max_width + outer * 2) as u32,
+        (total_height + outer * 2) as u32,
         image::Luma([255u8]),
     );
 
     for (i, (line, width)) in lines.iter().zip(widths.iter()).enumerate() {
-        let x = pad
+        let x = outer
             + match text_opts.align {
                 TextAlign::Left => 0,
                 TextAlign::Center => (max_width - width) / 2,
                 TextAlign::Right => max_width - width,
             };
-        let y = pad + line_height * i as i32;
+        let y = outer + line_height * i as i32;
         draw_text_mut(&mut canvas, image::Luma([0u8]), x, y, scale, font_ref, line);
         if text_opts.bold {
             // faux-bold: redraw offset by 1px when no separate bold face was found
@@ -169,7 +178,8 @@ pub fn raster_from_text(
         let (w, h) = (canvas.width(), canvas.height());
         imageproc::drawing::draw_hollow_rect_mut(
             &mut canvas,
-            imageproc::rect::Rect::at(0, 0).of_size(w, h),
+            imageproc::rect::Rect::at(frame_margin, frame_margin)
+                .of_size(w - frame_margin as u32 * 2, h - frame_margin as u32 * 2),
             image::Luma([0u8]),
         );
     }
