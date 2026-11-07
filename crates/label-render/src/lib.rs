@@ -373,16 +373,10 @@ pub fn physical_preview_png(
 
     let canvas_w = ((total_feed_mm * px_per_mm).round() as u32).max(1);
     let canvas_h = ((profile.tape_height_mm * px_per_mm).round() as u32).max(1);
-    // Tape background, outside the printable band.
-    let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, image::Luma([224u8]));
+    let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, image::Luma([255u8]));
 
     let band_h = ((profile.printable_height_mm * px_per_mm).round() as u32).max(1);
     let band_y = canvas_h.saturating_sub(band_h) / 2;
-    for y in band_y..(band_y + band_h).min(canvas_h) {
-        for x in 0..canvas_w {
-            canvas.put_pixel(x, y, image::Luma([255u8]));
-        }
-    }
 
     let content = imageops::rotate270(&raster_to_gray(raster));
     let content_w = ((content_feed_mm * px_per_mm).round() as u32).max(1);

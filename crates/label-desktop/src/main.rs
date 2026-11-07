@@ -1218,16 +1218,22 @@ impl LabelApp {
             v_flex()
                 .gap_2()
                 .p_3()
-                .bg(gpui::rgb(0xfafafa))
+                .items_start()
                 .border_t_1()
                 .border_color(gpui::rgb(0xe5e5e5))
                 .child(div().text_sm().text_color(gpui::rgb(0x888888)).child(
                     "Approximate print preview",
                 ))
                 .child(
+                    // `items_start()` above keeps this at the image's own
+                    // size instead of flexbox's default of stretching a
+                    // column's children to the full container width,
+                    // which turned the border into one big gray block
+                    // regardless of how short the actual label is.
                     div()
                         .border_1()
-                        .border_color(gpui::rgb(0xdddddd))
+                        .border_color(gpui::rgb(0x999999))
+                        .border_dashed()
                         .child(gpui_kit::img(png)),
                 ),
         )
