@@ -3687,11 +3687,13 @@ version = "0.1.0"
 name = "label-desktop"
 version = "0.1.0"
 dependencies = [
+ "dirs 5.0.1",
  "gpui-kit",
  "image",
  "label-core",
  "label-device",
  "label-render",
+ "rust-embed",
  "serde",
  "serde_json",
  "tokio",
@@ -3719,6 +3721,7 @@ dependencies = [
  "image",
  "imageproc",
  "label-core",
+ "resvg 0.46.0",
  "serde",
  "thiserror 2.0.21",
 ]

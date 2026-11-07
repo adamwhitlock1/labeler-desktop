@@ -1,3 +1,5 @@
+mod icons;
+
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -87,6 +89,8 @@ struct LabelApp {
     builder_feed_dots: u32,
     builder_feed_input: Entity<InputState>,
     builder_text_edit: Entity<InputState>,
+    icon_picker_open: bool,
+    icon_search: Entity<InputState>,
     builder_size_slider: Entity<SliderState>,
     builder_bold: bool,
     builder_shape_style: ShapeStyle,
@@ -118,6 +122,7 @@ impl LabelApp {
             InputState::new(window, cx).default_value(DEFAULT_BUILDER_FEED_DOTS.to_string())
         });
         let builder_text_edit = cx.new(|cx| InputState::new(window, cx).placeholder("Text..."));
+        let icon_search = cx.new(|cx| InputState::new(window, cx).placeholder("Search icons..."));
         let builder_size_slider = cx.new(|_| {
             // Shared by text, image and shape elements. Well over the
             // tape's physical 32-dot height: sizing past that (or
@@ -141,6 +146,11 @@ impl LabelApp {
                 this.update_selected_size(v.start(), cx);
             }
         }));
+        subs.push(cx.subscribe(&icon_search, |_this, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        }));
 
         Self {
             scanning: false,
@@ -157,6 +167,8 @@ impl LabelApp {
             builder_feed_dots: DEFAULT_BUILDER_FEED_DOTS,
             builder_feed_input,
             builder_text_edit,
+            icon_picker_open: false,
+            icon_search,
             builder_size_slider,
             builder_bold: false,
             builder_shape_style: ShapeStyle::Filled,
@@ -377,9 +389,7 @@ impl LabelApp {
             else {
                 return;
             };
-            let aspect = image::open(&path)
-                .map(|img| img.width() as f32 / img.height().max(1) as f32)
-                .unwrap_or(1.0);
+            let aspect = label_render::document::image_aspect_ratio(&path).unwrap_or(1.0);
             window
                 .update(|window, cx| {
                     view.update(cx, |this, cx| {
@@ -404,6 +414,36 @@ impl LabelApp {
                 .ok();
         })
         .detach();
+    }
+
+    fn toggle_icon_picker(&mut self, cx: &mut Context<Self>) {
+        self.icon_picker_open = !self.icon_picker_open;
+        cx.notify();
+    }
+
+    /// Adds a bundled icon (extracted to a cache file on first use) as an
+    /// `Image` element — from there it's identical to any other image:
+    /// draggable, resizable, printed through the same SVG rasterization
+    /// path as a user-supplied icon.
+    fn add_icon_element(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = icons::icon_cache_path(name) else { return };
+        let aspect = label_render::document::image_aspect_ratio(&path).unwrap_or(1.0);
+        let id = self.builder_next_id;
+        self.builder_next_id += 1;
+        let height = 24.0;
+        self.builder_elements.push(BuilderElement {
+            id,
+            x: 10.0,
+            y: 4.0,
+            kind: BuilderKind::Image {
+                path,
+                width: height * aspect,
+                height,
+                aspect,
+            },
+        });
+        self.icon_picker_open = false;
+        self.select_element(id, window, cx);
     }
 
     fn remove_selected_element(&mut self, cx: &mut Context<Self>) {
@@ -764,6 +804,12 @@ impl LabelApp {
                     this.add_shape_element(ShapeKind::Triangle, window, cx)
                 }))
                 .into_any_element(),
+            Button::new("add-icon")
+                .label("✦ Icon")
+                .small()
+                .when(self.icon_picker_open, |b| b.primary())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_icon_picker(cx)))
+                .into_any_element(),
             Button::new("remove")
                 .label("🗑")
                 .small()
@@ -818,6 +864,39 @@ impl LabelApp {
                     PRINT_HEAD_DOTS as f32 / 8.0,
                 )),
             )
+    }
+
+    fn render_icon_picker(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.icon_picker_open {
+            return None;
+        }
+        let query = self.icon_search.read(cx).value().to_lowercase();
+        let matches: Vec<String> = icons::icon_names()
+            .into_iter()
+            .filter(|n| query.is_empty() || n.contains(&query))
+            .take(60)
+            .collect();
+
+        Some(
+            v_flex()
+                .gap_2()
+                .p_3()
+                .bg(gpui::rgb(0xfafaff))
+                .border_b_1()
+                .border_color(gpui::rgb(0xe0e5f5))
+                .child(div().w(px(240.)).child(Input::new(&self.icon_search).cleanable(true)))
+                .child(
+                    h_flex().flex_wrap().gap_1().children(matches.into_iter().map(|name| {
+                        let label = name.clone();
+                        Button::new(SharedString::from(format!("icon-{name}")))
+                            .label(label)
+                            .xsmall()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.add_icon_element(&name, window, cx)
+                            }))
+                    })),
+                ),
+        )
     }
 
     fn render_property_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1065,6 +1144,7 @@ impl Render for LabelApp {
                     .flex_1()
                     .h_full()
                     .child(self.render_toolbar(cx))
+                    .children(self.render_icon_picker(cx))
                     .children(self.render_property_panel(cx))
                     .child(self.render_canvas(cx))
                     .children(self.render_dither_preview(cx))

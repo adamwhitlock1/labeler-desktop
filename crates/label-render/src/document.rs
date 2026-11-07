@@ -197,10 +197,19 @@ fn draw_image_element(
     x: i64,
     y: i64,
 ) -> Result<(), RenderError> {
-    let img = image::open(path)?.to_luma8();
     let target_w = ((width * SUPER as f32).round() as u32).max(1);
     let target_h = ((height * SUPER as f32).round() as u32).max(1);
-    let resized = imageops::resize(&img, target_w, target_h, imageops::FilterType::Lanczos3);
+
+    let is_svg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    let resized = if is_svg {
+        rasterize_svg(path, target_w, target_h)?
+    } else {
+        let img = image::open(path)?.to_luma8();
+        imageops::resize(&img, target_w, target_h, imageops::FilterType::Lanczos3)
+    };
 
     let (cw, ch) = canvas.dimensions();
     for (px, py, pixel) in resized.enumerate_pixels() {
@@ -211,6 +220,41 @@ fn draw_image_element(
         }
     }
     Ok(())
+}
+
+/// Rasterizes an SVG file to a grayscale bitmap at exactly `target_w` x
+/// `target_h`, composited over white — icons are typically drawn as
+/// colored/black shapes on a transparent background, and the printer only
+/// has black ink on white tape.
+fn rasterize_svg(path: &PathBuf, target_w: u32, target_h: u32) -> Result<GrayImage, RenderError> {
+    let data = std::fs::read(path).map_err(|e| RenderError::SvgIo(path.clone(), e))?;
+    let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default())
+        .map_err(|e| RenderError::SvgParse(path.clone(), e.to_string()))?;
+
+    let size = tree.size();
+    let (sw, sh) = (size.width().max(1.0), size.height().max(1.0));
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(target_w.max(1), target_h.max(1))
+        .ok_or_else(|| RenderError::SvgParse(path.clone(), "invalid target size".to_string()))?;
+    let transform = resvg::tiny_skia::Transform::from_scale(target_w as f32 / sw, target_h as f32 / sh);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    let mut gray = GrayImage::from_pixel(target_w, target_h, image::Luma([255u8]));
+    for (i, px) in pixmap.pixels().iter().enumerate() {
+        let a = px.alpha();
+        if a == 0 {
+            continue;
+        }
+        // Premultiplied RGB, composited over opaque white: the
+        // "darkening" an alpha-blended pixel contributes is exactly its
+        // premultiplied luma; what's left of the white background is
+        // (255 - alpha).
+        let lum = 0.299 * px.red() as f32 + 0.587 * px.green() as f32 + 0.114 * px.blue() as f32;
+        let out = (lum + (255 - a) as f32).clamp(0.0, 255.0) as u8;
+        let x = (i as u32) % target_w;
+        let y = (i as u32) / target_w;
+        gray.put_pixel(x, y, image::Luma([out]));
+    }
+    Ok(gray)
 }
 
 /// Stroke width for an unfilled shape's outline, in supersampled pixels.
@@ -336,6 +380,34 @@ pub fn document_preview_png(
 ) -> Result<Vec<u8>, RenderError> {
     let raster = raster_from_document(doc, render_opts)?;
     crate::preview_png(&raster, scale)
+}
+
+/// Returns an image file's width/height aspect ratio (width / height),
+/// for both raster formats and SVG — `image::image_dimensions` only
+/// handles the former, and a builder UI needs this to size a newly added
+/// image/icon element without distorting it.
+pub fn image_aspect_ratio(path: &std::path::Path) -> Option<f32> {
+    let is_svg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    if is_svg {
+        let data = std::fs::read(path).ok()?;
+        let tree = resvg::usvg::Tree::from_data(&data, &resvg::usvg::Options::default()).ok()?;
+        let size = tree.size();
+        if size.height() > 0.0 {
+            Some(size.width() / size.height())
+        } else {
+            None
+        }
+    } else {
+        let (w, h) = image::image_dimensions(path).ok()?;
+        if h > 0 {
+            Some(w as f32 / h as f32)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

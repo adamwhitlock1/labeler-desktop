@@ -21,6 +21,10 @@ pub enum RenderError {
     NoDefaultFont,
     #[error(transparent)]
     Image(#[from] image::ImageError),
+    #[error("could not read SVG file {0}: {1}")]
+    SvgIo(PathBuf, std::io::Error),
+    #[error("could not parse SVG file {0}: {1}")]
+    SvgParse(PathBuf, String),
 }
 
 /// Dithering strategy used to turn grayscale into the printer's 1-bit

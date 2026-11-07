@@ -12,9 +12,16 @@ distribution.
 - `label-device` — BLE discovery + connect + print via `btleplug`. **Verified against a
   real LT200B.**
 - `label-cli` — `scan`, `text`, `image`, `preview` subcommands. **Verified against a real LT200B.**
-- `label-desktop` — GPUI Kit desktop app: scan/select printer, text + image tabs, dithering,
-  alignment, bold/invert/frame, pixel-exact preview, copies, print. **Verified end-to-end
-  against a real LT200B.**
+- `label-desktop` — GPUI Kit desktop app built around a freeform Builder canvas: drag-and-drop
+  text, image, SVG icon, and shape (circle/square/triangle, filled/outline/dotted) elements,
+  a bundled searchable icon picker, save/load to JSON, threshold dithering, true-scale print
+  preview, copies, print. **Verified end-to-end against a real LT200B.**
+
+## Bundled assets
+
+`crates/label-desktop/assets/icons/` bundles the full [Heroicons](https://heroicons.com) solid
+(24px) set — MIT licensed, © Tailwind Labs, Inc. Arbitrary user-supplied SVGs also work via the
+image picker; both go through the same `resvg`-based rasterization path in `label-render`.
 
 ## Toolchain notes
 
