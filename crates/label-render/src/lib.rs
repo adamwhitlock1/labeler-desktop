@@ -3,6 +3,7 @@
 //! fixed cross-feed resolution, then binarize.
 
 pub mod document;
+pub mod fonts;
 
 use std::path::{Path, PathBuf};
 

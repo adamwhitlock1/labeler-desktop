@@ -45,6 +45,8 @@ pub enum ElementKind {
         size: f32,
         bold: bool,
         align: TextAlign,
+        /// `None` uses the default system font (see `load_font`).
+        font_path: Option<PathBuf>,
     },
     Image {
         path: PathBuf,
@@ -110,7 +112,8 @@ pub fn raster_from_document(
                 size,
                 bold,
                 align,
-            } => draw_text_element(&mut canvas, lines, *size, *bold, *align, sx, sy)?,
+                font_path,
+            } => draw_text_element(&mut canvas, lines, *size, *bold, *align, font_path.as_deref(), sx, sy)?,
             ElementKind::Image {
                 path,
                 width,
@@ -150,10 +153,11 @@ fn draw_text_element(
     size: f32,
     bold: bool,
     align: TextAlign,
+    font_path: Option<&std::path::Path>,
     x: i64,
     y: i64,
 ) -> Result<(), RenderError> {
-    let font = load_font(None, bold)?;
+    let font = load_font(font_path, bold)?;
     let font_ref = &font;
     let scale = PxScale::from(size * SUPER as f32);
     let scaled = font_ref.as_scaled(scale);
@@ -438,6 +442,7 @@ mod tests {
                 size: 20.0,
                 bold: false,
                 align: TextAlign::Left,
+                font_path: None,
             },
         });
         let raster = raster_from_document(&doc, &RenderOptions::default()).unwrap();

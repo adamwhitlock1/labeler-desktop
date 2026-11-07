@@ -41,6 +41,8 @@ use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::*;
 use gpui_kit::base::Disableable;
@@ -52,6 +54,7 @@ use label_render::document::{
     raster_from_document, Element as DocElement, ElementKind as DocElementKind, LabelDocument, ShapeKind,
     ShapeStyle,
 };
+use label_render::fonts::{available_fonts, FontChoice};
 use label_render::{Dither, RenderOptions, TextAlign};
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +69,15 @@ const DEFAULT_TEXT_SIZE: f32 = 46.0 * 0.6;
 
 #[derive(Clone, Serialize, Deserialize)]
 enum BuilderKind {
-    Text { text: String, size: f32, bold: bool },
+    Text {
+        text: String,
+        size: f32,
+        bold: bool,
+        /// `None` = system default. `#[serde(default)]` so labels saved
+        /// before this field existed still load.
+        #[serde(default)]
+        font_path: Option<PathBuf>,
+    },
     Image { path: PathBuf, width: f32, height: f32, aspect: f32 },
     Shape { shape: ShapeKind, size: f32, style: ShapeStyle },
 }
@@ -117,6 +128,14 @@ struct LabelApp {
     builder_size_slider: Entity<SliderState>,
     builder_bold: bool,
     builder_shape_style: ShapeStyle,
+    /// System fonts available to the text tool, enumerated once at
+    /// startup. "Default" (index 0) maps to `font_path: None`.
+    builder_font_choices: Vec<FontChoice>,
+    builder_font_select: Entity<SelectState<SearchableVec<String>>>,
+    /// Font files already handed to GPUI's text system, so the editor
+    /// canvas can render the real typeface — loading is a one-time cost
+    /// per font, not something to redo every render.
+    loaded_fonts: std::collections::HashSet<PathBuf>,
     canvas_origin: Rc<Cell<Point<Pixels>>>,
     /// (element id, grab offset within the element, in canvas-local px)
     drag_grab: Option<(u64, f32, f32)>,
@@ -155,6 +174,15 @@ impl LabelApp {
             SliderState::new().min(6.0).max(46.0).default_value(DEFAULT_TEXT_SIZE).step(1.0)
         });
 
+        let builder_font_choices = available_fonts();
+        let font_options = SearchableVec::new(
+            std::iter::once("Default".to_string())
+                .chain(builder_font_choices.iter().map(|f| f.family.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let builder_font_select =
+            cx.new(|cx| SelectState::new(font_options, Some(IndexPath::default()), window, cx).searchable(true));
+
         let mut subs = Vec::new();
         subs.push(cx.subscribe(&builder_feed_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
@@ -175,6 +203,9 @@ impl LabelApp {
             if matches!(event, InputEvent::Change) {
                 cx.notify();
             }
+        }));
+        subs.push(cx.subscribe(&builder_font_select, |this, _, _event: &SelectEvent<SearchableVec<String>>, cx| {
+            this.update_selected_font(cx);
         }));
 
         Self {
@@ -199,6 +230,9 @@ impl LabelApp {
             builder_size_slider,
             builder_bold: false,
             builder_shape_style: ShapeStyle::Filled,
+            builder_font_choices,
+            builder_font_select,
+            loaded_fonts: std::collections::HashSet::new(),
             canvas_origin: Rc::new(Cell::new(Point::default())),
             drag_grab: None,
             builder_scroll_x: 0.0,
@@ -301,8 +335,8 @@ impl LabelApp {
         window.focus(&self.focus_handle, cx);
         if let Some(el) = self.builder_elements.iter().find(|e| e.id == id) {
             match &el.kind {
-                BuilderKind::Text { text, size, bold } => {
-                    let (text, size, bold) = (text.clone(), *size, *bold);
+                BuilderKind::Text { text, size, bold, font_path } => {
+                    let (text, size, bold, font_path) = (text.clone(), *size, *bold, font_path.clone());
                     self.builder_text_edit.update(cx, |s, cx| {
                         s.set_value(text, window, cx);
                     });
@@ -310,6 +344,14 @@ impl LabelApp {
                         s.set_value(size, window, cx);
                     });
                     self.builder_bold = bold;
+                    let family = font_path
+                        .as_ref()
+                        .and_then(|p| self.builder_font_choices.iter().find(|f| &f.path == p))
+                        .map(|f| f.family.clone())
+                        .unwrap_or_else(|| "Default".to_string());
+                    self.builder_font_select.update(cx, |s, cx| {
+                        s.set_selected_value(&family, window, cx);
+                    });
                 }
                 BuilderKind::Image { height, .. } => {
                     let height = *height;
@@ -350,6 +392,44 @@ impl LabelApp {
                     *width = value * *aspect;
                 }
                 BuilderKind::Shape { size, .. } => *size = value,
+            }
+        }
+        cx.notify();
+    }
+
+    /// Hands every font a text element currently references to GPUI's text
+    /// system, so `.font_family(...)` in the canvas can actually find it —
+    /// otherwise the editor silently falls back to the default UI font
+    /// while only the offline-rendered print preview picks up the choice.
+    fn ensure_fonts_loaded(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<PathBuf> = self
+            .builder_elements
+            .iter()
+            .filter_map(|el| match &el.kind {
+                BuilderKind::Text { font_path: Some(p), .. } if !self.loaded_fonts.contains(p) => {
+                    Some(p.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for path in paths {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let _ = cx.text_system().add_fonts(vec![std::borrow::Cow::Owned(bytes)]);
+            }
+            self.loaded_fonts.insert(path);
+        }
+    }
+
+    fn update_selected_font(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.builder_selected else { return };
+        let family = self.builder_font_select.read(cx).selected_value().cloned();
+        let font_path = family
+            .filter(|f| f != "Default")
+            .and_then(|f| self.builder_font_choices.iter().find(|c| c.family == f))
+            .map(|c| c.path.clone());
+        if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
+            if let BuilderKind::Text { font_path: p, .. } = &mut el.kind {
+                *p = font_path;
             }
         }
         cx.notify();
@@ -401,6 +481,7 @@ impl LabelApp {
                 text: "Text".to_string(),
                 size: DEFAULT_TEXT_SIZE,
                 bold: false,
+                font_path: None,
             },
         });
         self.select_element(id, window, cx);
@@ -504,11 +585,12 @@ impl LabelApp {
         let mut doc = LabelDocument::new(self.builder_feed_dots, PRINT_HEAD_DOTS);
         for el in &self.builder_elements {
             let kind = match &el.kind {
-                BuilderKind::Text { text, size, bold } => DocElementKind::Text {
+                BuilderKind::Text { text, size, bold, font_path } => DocElementKind::Text {
                     lines: text.lines().map(str::to_string).collect(),
                     size: *size,
                     bold: *bold,
                     align: TextAlign::Left,
+                    font_path: font_path.clone(),
                 },
                 BuilderKind::Image { path, width, height, .. } => DocElementKind::Image {
                     path: path.clone(),
@@ -744,7 +826,7 @@ impl LabelApp {
         let selected = self.builder_selected == Some(id);
 
         let content: AnyElement = match &el.kind {
-            BuilderKind::Text { text, size, bold } => div()
+            BuilderKind::Text { text, size, bold, font_path } => div()
                 .text_size(px(*size * PREVIEW_SCALE))
                 // Tight, 1:1 line height: GPUI's default leading made the
                 // element's bounding box noticeably taller than the glyphs
@@ -753,6 +835,12 @@ impl LabelApp {
                 .line_height(px(*size * PREVIEW_SCALE))
                 .h(px(*size * PREVIEW_SCALE))
                 .when(*bold, |d| d.font_weight(gpui::FontWeight::BOLD))
+                .when_some(
+                    font_path.as_ref().and_then(|p| {
+                        self.builder_font_choices.iter().find(|f| &f.path == p)
+                    }),
+                    |d, f| d.font_family(f.family.clone()),
+                )
                 .child(if text.is_empty() {
                     " ".to_string()
                 } else {
@@ -1007,6 +1095,7 @@ impl LabelApp {
                 .border_color(gpui::rgb(0xe0e5f5))
                 .when(matches!(el.kind, BuilderKind::Text { .. }), |row| {
                     row.child(div().w(px(200.)).child(Input::new(&self.builder_text_edit)))
+                        .child(div().w(px(160.)).child(Select::new(&self.builder_font_select).placeholder("Font")))
                         .child(
                             h_flex()
                                 .gap_2()
@@ -1243,6 +1332,7 @@ impl LabelApp {
 impl Render for LabelApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_recompute_preview(window, cx);
+        self.ensure_fonts_loaded(cx);
         h_flex()
             .size_full()
             .track_focus(&self.focus_handle)

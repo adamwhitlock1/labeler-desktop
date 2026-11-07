@@ -3719,6 +3719,7 @@ name = "label-render"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
+ "fontdb",
  "image",
  "imageproc",
  "label-core",

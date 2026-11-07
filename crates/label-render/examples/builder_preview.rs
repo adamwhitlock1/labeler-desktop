@@ -12,6 +12,7 @@ fn main() {
             size: 14.0,
             bold: true,
             align: TextAlign::Left,
+            font_path: None,
         },
     });
     doc.elements.push(Element {
@@ -23,6 +24,7 @@ fn main() {
             size: 10.0,
             bold: false,
             align: TextAlign::Left,
+            font_path: None,
         },
     });
 

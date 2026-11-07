@@ -12,3 +12,4 @@ imageproc = "0.27"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 resvg = "0.46"
+fontdb = "0.23"
