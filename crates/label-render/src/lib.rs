@@ -2,6 +2,8 @@
 //! printer can print: rotate to portrait, resize to the print head's
 //! fixed cross-feed resolution, then binarize.
 
+pub mod document;
+
 use std::path::{Path, PathBuf};
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
@@ -105,7 +107,7 @@ fn default_font_candidates(bold: bool) -> &'static [&'static str] {
     }
 }
 
-fn load_font(path: Option<&Path>, bold: bool) -> Result<FontVec, RenderError> {
+pub(crate) fn load_font(path: Option<&Path>, bold: bool) -> Result<FontVec, RenderError> {
     let candidates: Vec<PathBuf> = match path {
         Some(p) => vec![p.to_path_buf()],
         None => default_font_candidates(bold).iter().map(PathBuf::from).collect(),
@@ -219,7 +221,7 @@ pub fn raster_from_dynamic_image(img: &DynamicImage, opts: &RenderOptions) -> Ra
     Raster::new(cross, feed, bits)
 }
 
-fn binarize(img: &GrayImage, dither: Dither, invert: bool) -> Vec<bool> {
+pub(crate) fn binarize(img: &GrayImage, dither: Dither, invert: bool) -> Vec<bool> {
     let (w, h) = img.dimensions();
     let black = |v: bool| if invert { !v } else { v };
 
@@ -280,7 +282,7 @@ fn binarize(img: &GrayImage, dither: Dither, invert: bool) -> Vec<bool> {
     }
 }
 
-fn raster_to_gray(raster: &Raster) -> GrayImage {
+pub(crate) fn raster_to_gray(raster: &Raster) -> GrayImage {
     let mut img = GrayImage::from_pixel(raster.cross, raster.feed, image::Luma([255u8]));
     for (i, &bit) in raster.bits.iter().enumerate() {
         let x = (i as u32) % raster.cross;

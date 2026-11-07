@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -27,13 +29,35 @@ use gpui_kit::base::Disableable;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{Image, ImageFormat, PathPromptOptions};
 use gpui_kit::*;
-use label_core::create_job;
+use label_core::{create_job, PRINT_HEAD_DOTS};
+use label_render::document::{
+    raster_from_document, Element as DocElement, ElementKind as DocElementKind, LabelDocument,
+};
 use label_render::{
     raster_from_dynamic_image, raster_from_text, Dither, RenderOptions, TextAlign, TextOptions,
 };
 
 const DITHER_OPTIONS: [&str; 3] = ["Threshold", "Floyd-Steinberg", "Atkinson"];
 const ALIGN_OPTIONS: [&str; 3] = ["Left", "Center", "Right"];
+
+/// Preview pixels per print dot in the Builder tab's canvas.
+const PREVIEW_SCALE: f32 = 6.0;
+const DEFAULT_BUILDER_FEED_DOTS: u32 = 260;
+
+#[derive(Clone)]
+enum BuilderKind {
+    Text { text: String, size: f32, bold: bool },
+    Image { path: PathBuf, width: f32, height: f32, aspect: f32 },
+}
+
+#[derive(Clone)]
+struct BuilderElement {
+    id: u64,
+    /// Top-left, in preview pixels (canvas-local).
+    x: f32,
+    y: f32,
+    kind: BuilderKind,
+}
 
 fn dither_from_label(label: &str) -> Dither {
     match label {
@@ -83,6 +107,19 @@ struct LabelApp {
 
     printing: bool,
 
+    // builder tab
+    builder_elements: Vec<BuilderElement>,
+    builder_selected: Option<u64>,
+    builder_next_id: u64,
+    builder_feed_dots: u32,
+    builder_feed_slider: Entity<SliderState>,
+    builder_text_edit: Entity<InputState>,
+    builder_size_slider: Entity<SliderState>,
+    builder_bold: bool,
+    canvas_origin: Rc<Cell<Point<Pixels>>>,
+    /// (element id, grab offset within the element, in canvas-local px)
+    drag_grab: Option<(u64, f32, f32)>,
+
     _subscriptions: Vec<Subscription>,
 }
 
@@ -115,6 +152,17 @@ impl LabelApp {
         let contrast = cx.new(|_| {
             SliderState::new().min(-100.0).max(100.0).default_value(0.0).step(1.0)
         });
+        let builder_feed_slider = cx.new(|_| {
+            SliderState::new()
+                .min(60.0)
+                .max(800.0)
+                .default_value(DEFAULT_BUILDER_FEED_DOTS as f32)
+                .step(10.0)
+        });
+        let builder_text_edit = cx.new(|cx| InputState::new(window, cx).placeholder("Text..."));
+        let builder_size_slider = cx.new(|_| {
+            SliderState::new().min(6.0).max(32.0).default_value(14.0).step(1.0)
+        });
 
         let mut subs = Vec::new();
         subs.push(cx.subscribe(&text_input, |this, _, event, cx| {
@@ -138,6 +186,22 @@ impl LabelApp {
                 this.rebuild_preview(cx);
             }
         }));
+        subs.push(cx.subscribe(&builder_feed_slider, |this, _, event, cx| {
+            if let SliderEvent::Change(v) = event {
+                this.builder_feed_dots = v.start().round() as u32;
+                cx.notify();
+            }
+        }));
+        subs.push(cx.subscribe(&builder_text_edit, |this, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                this.update_selected_text(cx);
+            }
+        }));
+        subs.push(cx.subscribe(&builder_size_slider, |this, _, event, cx| {
+            if let SliderEvent::Change(v) = event {
+                this.update_selected_size(v.start(), cx);
+            }
+        }));
 
         let mut app = Self {
             scanning: false,
@@ -158,6 +222,16 @@ impl LabelApp {
             preview_png: None,
             feed_dots: 0,
             printing: false,
+            builder_elements: Vec::new(),
+            builder_selected: None,
+            builder_next_id: 1,
+            builder_feed_dots: DEFAULT_BUILDER_FEED_DOTS,
+            builder_feed_slider,
+            builder_text_edit,
+            builder_size_slider,
+            builder_bold: false,
+            canvas_origin: Rc::new(Cell::new(Point::default())),
+            drag_grab: None,
             _subscriptions: subs,
         };
         app.rebuild_preview(cx);
@@ -180,6 +254,12 @@ impl LabelApp {
     }
 
     fn rebuild_preview(&mut self, cx: &mut Context<Self>) {
+        if self.active_tab == 2 {
+            self.feed_dots = self.builder_feed_dots;
+            self.preview_png = None;
+            cx.notify();
+            return;
+        }
         let render_opts = self.render_opts(cx);
         let raster = if self.active_tab == 0 {
             let text = self.text_input.read(cx).value().to_string();
@@ -237,6 +317,14 @@ impl LabelApp {
 
     fn current_job(&self, cx: &App) -> Option<Vec<Vec<u8>>> {
         let render_opts = self.render_opts(cx);
+        if self.active_tab == 2 {
+            if self.builder_elements.is_empty() {
+                return None;
+            }
+            let doc = self.builder_document();
+            let raster = raster_from_document(&doc, &render_opts).ok()?;
+            return Some(create_job(&raster));
+        }
         let raster = if self.active_tab == 0 {
             let text = self.text_input.read(cx).value().to_string();
             if text.trim().is_empty() {
@@ -320,6 +408,167 @@ impl LabelApp {
                 .ok();
         })
         .detach();
+    }
+
+    fn selected_element(&self) -> Option<&BuilderElement> {
+        let id = self.builder_selected?;
+        self.builder_elements.iter().find(|e| e.id == id)
+    }
+
+    fn select_element(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.builder_selected = Some(id);
+        if let Some(el) = self.builder_elements.iter().find(|e| e.id == id) {
+            match &el.kind {
+                BuilderKind::Text { text, size, bold } => {
+                    let (text, size, bold) = (text.clone(), *size, *bold);
+                    self.builder_text_edit.update(cx, |s, cx| {
+                        s.set_value(text, window, cx);
+                    });
+                    self.builder_size_slider.update(cx, |s, cx| {
+                        s.set_value(size, window, cx);
+                    });
+                    self.builder_bold = bold;
+                }
+                BuilderKind::Image { height, .. } => {
+                    let height = *height;
+                    self.builder_size_slider.update(cx, |s, cx| {
+                        s.set_value(height, window, cx);
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn update_selected_text(&mut self, cx: &mut Context<Self>) {
+        let text = self.builder_text_edit.read(cx).value().to_string();
+        let Some(id) = self.builder_selected else { return };
+        if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
+            if let BuilderKind::Text { text: t, .. } = &mut el.kind {
+                *t = text;
+            }
+        }
+        cx.notify();
+    }
+
+    fn update_selected_size(&mut self, value: f32, cx: &mut Context<Self>) {
+        let Some(id) = self.builder_selected else { return };
+        if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
+            match &mut el.kind {
+                BuilderKind::Text { size, .. } => *size = value,
+                BuilderKind::Image { width, height, aspect, .. } => {
+                    *height = value;
+                    *width = value * *aspect;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn toggle_selected_bold(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.builder_selected else { return };
+        self.builder_bold = !self.builder_bold;
+        let bold = self.builder_bold;
+        if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
+            if let BuilderKind::Text { bold: b, .. } = &mut el.kind {
+                *b = bold;
+            }
+        }
+        cx.notify();
+    }
+
+    fn add_text_element(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.builder_next_id;
+        self.builder_next_id += 1;
+        self.builder_elements.push(BuilderElement {
+            id,
+            x: 10.0,
+            y: 10.0,
+            kind: BuilderKind::Text {
+                text: "Text".to_string(),
+                size: 14.0,
+                bold: false,
+            },
+        });
+        self.select_element(id, window, cx);
+    }
+
+    fn add_image_element(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Select an image".into()),
+        });
+        cx.spawn_in(window, async move |view, window| {
+            let Some(path) = paths
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|p| p.into_iter().next())
+            else {
+                return;
+            };
+            let aspect = image::open(&path)
+                .map(|img| img.width() as f32 / img.height().max(1) as f32)
+                .unwrap_or(1.0);
+            window
+                .update(|window, cx| {
+                    view.update(cx, |this, cx| {
+                        let id = this.builder_next_id;
+                        this.builder_next_id += 1;
+                        let height = 24.0;
+                        this.builder_elements.push(BuilderElement {
+                            id,
+                            x: 10.0,
+                            y: 4.0,
+                            kind: BuilderKind::Image {
+                                path,
+                                width: height * aspect,
+                                height,
+                                aspect,
+                            },
+                        });
+                        this.select_element(id, window, cx);
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn remove_selected_element(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.builder_selected.take() else { return };
+        self.builder_elements.retain(|e| e.id != id);
+        cx.notify();
+    }
+
+    fn builder_document(&self) -> LabelDocument {
+        let mut doc = LabelDocument::new(self.builder_feed_dots, PRINT_HEAD_DOTS);
+        for el in &self.builder_elements {
+            let kind = match &el.kind {
+                BuilderKind::Text { text, size, bold } => DocElementKind::Text {
+                    lines: text.lines().map(str::to_string).collect(),
+                    size: *size,
+                    bold: *bold,
+                    align: TextAlign::Left,
+                },
+                BuilderKind::Image { path, width, height, .. } => DocElementKind::Image {
+                    path: path.clone(),
+                    width: *width,
+                    height: *height,
+                },
+            };
+            doc.elements.push(DocElement {
+                id: el.id,
+                x: el.x / PREVIEW_SCALE,
+                y: el.y / PREVIEW_SCALE,
+                kind,
+            });
+        }
+        doc
     }
 
     fn print(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -493,6 +742,172 @@ impl LabelApp {
             )
     }
 
+    fn render_builder_element(&self, el: &BuilderElement, cx: &mut Context<Self>) -> impl IntoElement {
+        let id = el.id;
+        let (ex, ey) = (el.x, el.y);
+        let selected = self.builder_selected == Some(id);
+
+        let content: AnyElement = match &el.kind {
+            BuilderKind::Text { text, size, bold } => div()
+                .text_size(px(*size * PREVIEW_SCALE))
+                .when(*bold, |d| d.font_weight(gpui::FontWeight::BOLD))
+                .child(if text.is_empty() {
+                    " ".to_string()
+                } else {
+                    text.clone()
+                })
+                .into_any_element(),
+            BuilderKind::Image { path, width, height, .. } => div()
+                .w(px(*width * PREVIEW_SCALE))
+                .h(px(*height * PREVIEW_SCALE))
+                .child(
+                    gpui_kit::img(path.clone())
+                        .w_full()
+                        .h_full()
+                        .object_fit(ObjectFit::Contain),
+                )
+                .into_any_element(),
+        };
+
+        div()
+            .id(("builder-el", id))
+            .absolute()
+            .left(px(el.x))
+            .top(px(el.y))
+            .when(selected, |d| {
+                d.border_1().border_color(gpui::rgb(0x3b82f6)).p(px(1.))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.select_element(id, window, cx);
+            }))
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(move |this, event: &gpui_kit::MouseDownEvent, _window, _cx| {
+                    let origin = this.canvas_origin.get();
+                    let local_x = f32::from(event.position.x - origin.x);
+                    let local_y = f32::from(event.position.y - origin.y);
+                    this.drag_grab = Some((id, local_x - ex, local_y - ey));
+                }),
+            )
+            .child(content)
+    }
+
+    fn render_builder_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let canvas_w = self.builder_feed_dots as f32 * PREVIEW_SCALE;
+        let canvas_h = PRINT_HEAD_DOTS as f32 * PREVIEW_SCALE;
+        let origin_cell = self.canvas_origin.clone();
+
+        v_flex()
+            .gap_3()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(Button::new("add-text").label("Add Text").on_click(
+                        cx.listener(|this, _, window, cx| this.add_text_element(window, cx)),
+                    ))
+                    .child(Button::new("add-image").label("Add Image...").on_click(
+                        cx.listener(|this, _, window, cx| this.add_image_element(window, cx)),
+                    ))
+                    .child(
+                        Button::new("remove")
+                            .label("Remove")
+                            .disabled(self.builder_selected.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| this.remove_selected_element(cx))),
+                    )
+                    .child(div().text_sm().child("Label length"))
+                    .child(div().w(px(140.)).child(Slider::new(&self.builder_feed_slider)))
+                    .child(div().text_sm().child(format!("{} dots", self.builder_feed_dots))),
+            )
+            .child(
+                div().text_sm().text_color(gpui::rgb(0x888888)).child(format!(
+                    "Editor is zoomed in {PREVIEW_SCALE:.0}x — actual printed size is about {:.0}mm long x {:.0}mm tall (estimated; printer DPI unverified)",
+                    self.builder_feed_dots as f32 / 8.0,
+                    PRINT_HEAD_DOTS as f32 / 8.0,
+                )),
+            )
+            .when_some(self.selected_element().cloned(), |flex, el| {
+                flex.child(
+                    h_flex()
+                        .gap_4()
+                        .items_center()
+                        .p_2()
+                        .bg(gpui::rgb(0xf5f5f5))
+                        .when(matches!(el.kind, BuilderKind::Text { .. }), |row| {
+                            row.child(div().w(px(220.)).child(Input::new(&self.builder_text_edit)))
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(Switch::new("builder-bold").checked(self.builder_bold).on_change(
+                                            cx.listener(|this, _, _, cx| this.toggle_selected_bold(cx)),
+                                        ))
+                                        .child("Bold"),
+                                )
+                        })
+                        .child(div().text_sm().child("Size"))
+                        .child(div().w(px(140.)).child(Slider::new(&self.builder_size_slider))),
+                )
+            })
+            .child(
+                div()
+                    .overflow_x_scrollbar()
+                    .w_full()
+                    .child(
+                        div()
+                            .id("builder-canvas")
+                            .relative()
+                            .w(px(canvas_w))
+                            .h(px(canvas_h))
+                            .bg(gpui::white())
+                            .border_1()
+                            .border_color(gpui::rgb(0xcccccc))
+                            .on_mouse_move(cx.listener(
+                                |this, event: &gpui_kit::MouseMoveEvent, _window, cx| {
+                                    let Some((id, dx, dy)) = this.drag_grab else {
+                                        return;
+                                    };
+                                    let origin = this.canvas_origin.get();
+                                    let local_x = f32::from(event.position.x - origin.x);
+                                    let local_y = f32::from(event.position.y - origin.y);
+                                    if let Some(el) = this.builder_elements.iter_mut().find(|e| e.id == id) {
+                                        el.x = (local_x - dx).max(0.0);
+                                        el.y = (local_y - dy).max(0.0);
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_up(
+                                gpui_kit::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.drag_grab = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .on_mouse_up_out(
+                                gpui_kit::MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.drag_grab = None;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(gpui_kit::canvas(
+                                move |bounds, _window, _cx| {
+                                    origin_cell.set(bounds.origin);
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full())
+                            .children(
+                                self.builder_elements
+                                    .iter()
+                                    .map(|el| self.render_builder_element(el, cx).into_any_element()),
+                            ),
+                    ),
+            )
+    }
+
     fn render_shared_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_4()
@@ -562,20 +977,23 @@ impl Render for LabelApp {
                                 this.rebuild_preview(cx);
                             }))
                             .child(Tab::new().label("Text"))
-                            .child(Tab::new().label("Image")),
+                            .child(Tab::new().label("Image"))
+                            .child(Tab::new().label("Builder")),
                     )
                     .child(
                         v_flex()
                             .p_4()
                             .gap_3()
-                            .child(if self.active_tab == 0 {
-                                self.render_text_tab(cx).into_any_element()
-                            } else {
-                                self.render_image_tab(cx).into_any_element()
+                            .child(match self.active_tab {
+                                0 => self.render_text_tab(cx).into_any_element(),
+                                1 => self.render_image_tab(cx).into_any_element(),
+                                _ => self.render_builder_tab(cx).into_any_element(),
                             })
-                            .child(self.render_shared_controls(cx)),
+                            .when(self.active_tab != 2, |flex| {
+                                flex.child(self.render_shared_controls(cx))
+                            }),
                     )
-                    .child(self.render_preview(cx))
+                    .when(self.active_tab != 2, |flex| flex.child(self.render_preview(cx)))
                     .child(
                         h_flex()
                             .p_3()
