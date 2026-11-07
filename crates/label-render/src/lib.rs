@@ -326,6 +326,83 @@ pub fn estimate_length_mm(raster: &Raster, feed_dots_per_mm: f32) -> f32 {
     raster.feed as f32 / feed_dots_per_mm.max(0.01)
 }
 
+/// Physical geometry of the tape, measured directly off a printed label:
+/// the printable band is only part of the tape's total height, centered
+/// within it, and the printer adds a fixed blank leader/trailer to every
+/// job that a plain dot-for-dot preview has no way to show.
+#[derive(Debug, Clone, Copy)]
+pub struct TapeProfile {
+    pub tape_height_mm: f32,
+    pub printable_height_mm: f32,
+    pub leader_trailer_mm: f32,
+}
+
+impl Default for TapeProfile {
+    /// LT200B, measured: a 12mm-tall tape with a 6mm printable band
+    /// centered in it, and roughly 10mm of blank feed before and after
+    /// any job.
+    fn default() -> Self {
+        Self {
+            tape_height_mm: 12.0,
+            printable_height_mm: 6.0,
+            leader_trailer_mm: 10.0,
+        }
+    }
+}
+
+/// Renders a raster as it will actually look on tape: true relative
+/// proportions (the feed direction isn't naively 1 raw dot = 1 pixel —
+/// the printer's feed-direction dot pitch is about half its cross-feed
+/// pitch, see [`document::raster_from_document`] — so a plain dot-grid
+/// preview comes out visibly stretched), the printable band shown
+/// centered in the full tape height, and the leader/trailer blank space
+/// the printer adds to every job.
+pub fn physical_preview_png(
+    raster: &Raster,
+    profile: &TapeProfile,
+    px_per_mm: f32,
+) -> Result<Vec<u8>, RenderError> {
+    let px_per_mm = px_per_mm.max(0.1);
+    let cross_dots_per_mm = raster.cross as f32 / profile.printable_height_mm.max(0.1);
+    // The feed direction packs roughly twice as many dots per mm as the
+    // cross direction (same factor `raster_from_document` bakes into its
+    // final resize).
+    let feed_dots_per_mm = cross_dots_per_mm * 2.0;
+    let content_feed_mm = raster.feed as f32 / feed_dots_per_mm;
+    let total_feed_mm = content_feed_mm + 2.0 * profile.leader_trailer_mm;
+
+    let canvas_w = ((total_feed_mm * px_per_mm).round() as u32).max(1);
+    let canvas_h = ((profile.tape_height_mm * px_per_mm).round() as u32).max(1);
+    // Tape background, outside the printable band.
+    let mut canvas = GrayImage::from_pixel(canvas_w, canvas_h, image::Luma([224u8]));
+
+    let band_h = ((profile.printable_height_mm * px_per_mm).round() as u32).max(1);
+    let band_y = canvas_h.saturating_sub(band_h) / 2;
+    for y in band_y..(band_y + band_h).min(canvas_h) {
+        for x in 0..canvas_w {
+            canvas.put_pixel(x, y, image::Luma([255u8]));
+        }
+    }
+
+    let content = imageops::rotate270(&raster_to_gray(raster));
+    let content_w = ((content_feed_mm * px_per_mm).round() as u32).max(1);
+    let resized = imageops::resize(&content, content_w, band_h, imageops::FilterType::Lanczos3);
+
+    let x_off = (profile.leader_trailer_mm * px_per_mm).round() as i64;
+    for (px, py, pixel) in resized.enumerate_pixels() {
+        let dx = x_off + px as i64;
+        let dy = band_y as i64 + py as i64;
+        if dx >= 0 && dy >= 0 && (dx as u32) < canvas_w && (dy as u32) < canvas_h {
+            canvas.put_pixel(dx as u32, dy as u32, *pixel);
+        }
+    }
+
+    let mut bytes = Vec::new();
+    DynamicImage::ImageLuma8(canvas)
+        .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

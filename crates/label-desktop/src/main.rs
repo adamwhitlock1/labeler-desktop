@@ -39,12 +39,11 @@ use serde::{Deserialize, Serialize};
 /// Preview pixels per print dot in the builder canvas.
 const PREVIEW_SCALE: f32 = 6.0;
 const DEFAULT_BUILDER_FEED_DOTS: u32 = 175;
+/// Measured directly off a printed label: the 32-dot printable band is
+/// 6mm tall (see [`label_render::TapeProfile::default`]).
+const CROSS_DOTS_PER_MM: f32 = PRINT_HEAD_DOTS as f32 / 6.0;
 /// New text starts at 60% of the size slider's max.
 const DEFAULT_TEXT_SIZE: f32 = 46.0 * 0.6;
-
-/// Quick-insert palette for the text tool: plain Unicode symbols the
-/// system font already renders, no icon font required.
-const GLYPHS: [&str; 10] = ["★", "♥", "✓", "✗", "●", "■", "▲", "→", "☀", "⚠"];
 
 #[derive(Clone, Serialize, Deserialize)]
 enum BuilderKind {
@@ -109,6 +108,7 @@ struct LabelApp {
     /// made typing and dragging visibly laggy.
     preview_cache: Option<Arc<Image>>,
     last_preview_compute: std::time::Instant,
+    preview_catchup_scheduled: bool,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -177,6 +177,7 @@ impl LabelApp {
             builder_scroll_x: 0.0,
             preview_cache: None,
             last_preview_compute: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            preview_catchup_scheduled: false,
             _subscriptions: subs,
         }
     }
@@ -195,6 +196,17 @@ impl LabelApp {
         if let Ok(dots) = text.trim().parse::<u32>() {
             self.builder_feed_dots = dots.clamp(10, 2000);
         }
+        cx.notify();
+    }
+
+    /// Up/down arrow keys on the length field, since it's a plain number
+    /// input rather than a stepper widget.
+    fn step_feed_dots(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let new = (self.builder_feed_dots as i32 + delta).clamp(10, 2000) as u32;
+        self.builder_feed_dots = new;
+        self.builder_feed_input.update(cx, |s, cx| {
+            s.set_value(new.to_string(), window, cx);
+        });
         cx.notify();
     }
 
@@ -287,23 +299,6 @@ impl LabelApp {
             }
         }
         cx.notify();
-    }
-
-    /// Appends a glyph to the selected text element, via the shared
-    /// quick-insert palette. These are plain Unicode symbols rendered by
-    /// the same system font already in use — no icon font needed for
-    /// simple shapes/marks; a real icon set (Font Awesome et al.) is a
-    /// separate addition if more coverage is ever needed.
-    fn insert_glyph(&mut self, glyph: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if !matches!(self.selected_element().map(|e| &e.kind), Some(BuilderKind::Text { .. })) {
-            return;
-        }
-        let mut text = self.builder_text_edit.read(cx).value().to_string();
-        text.push_str(glyph);
-        self.builder_text_edit.update(cx, |s, cx| {
-            s.set_value(text, window, cx);
-        });
-        self.update_selected_text(cx);
     }
 
     fn update_selected_size(&mut self, value: f32, cx: &mut Context<Self>) {
@@ -758,73 +753,81 @@ impl LabelApp {
     }
 
     /// A visually distinct card grouping a few related toolbar controls,
-    /// so the toolbar reads as sections (Insert / Document / File)
-    /// instead of one long undifferentiated row of buttons.
+    /// each wrapped in its own small bordered chip — without this, e.g.
+    /// the length input and the "dots" label next to it read as one
+    /// control instead of two.
     fn toolbar_group(&self, children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
-        h_flex()
-            .gap_2()
-            .items_center()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(gpui::rgb(0xf0f0f0))
-            .children(children)
+        h_flex().gap_1().items_center().children(children.into_iter().map(|child| {
+            div()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .border_1()
+                .border_color(gpui::rgb(0xe0e0e0))
+                .bg(gpui::rgb(0xf7f7f7))
+                .child(child)
+        }))
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let insert_group = self.toolbar_group([
-            Button::new("add-text")
-                .label("T  Text")
-                .small()
-                .on_click(cx.listener(|this, _, window, cx| this.add_text_element(window, cx)))
-                .into_any_element(),
-            Button::new("add-image")
-                .label("🖼 Image")
-                .small()
-                .on_click(cx.listener(|this, _, window, cx| this.add_image_element(window, cx)))
-                .into_any_element(),
-            Button::new("add-circle")
-                .label("○")
-                .small()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.add_shape_element(ShapeKind::Circle, window, cx)
-                }))
-                .into_any_element(),
-            Button::new("add-square")
-                .label("□")
-                .small()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.add_shape_element(ShapeKind::Square, window, cx)
-                }))
-                .into_any_element(),
-            Button::new("add-triangle")
-                .label("△")
-                .small()
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.add_shape_element(ShapeKind::Triangle, window, cx)
-                }))
-                .into_any_element(),
-            Button::new("add-icon")
-                .label("✦ Icon")
-                .small()
-                .when(self.icon_picker_open, |b| b.primary())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_icon_picker(cx)))
-                .into_any_element(),
-            Button::new("remove")
-                .label("🗑")
-                .small()
-                .disabled(self.builder_selected.is_none())
-                .on_click(cx.listener(|this, _, _, cx| this.remove_selected_element(cx)))
-                .into_any_element(),
-        ]);
+        let insert_group = self.toolbar_group([h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new("add-text")
+                    .label("T  Text")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| this.add_text_element(window, cx))),
+            )
+            .child(
+                Button::new("add-image")
+                    .label("🖼 Image")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| this.add_image_element(window, cx))),
+            )
+            .child(Button::new("add-circle").label("○").small().on_click(cx.listener(
+                |this, _, window, cx| this.add_shape_element(ShapeKind::Circle, window, cx),
+            )))
+            .child(Button::new("add-square").label("□").small().on_click(cx.listener(
+                |this, _, window, cx| this.add_shape_element(ShapeKind::Square, window, cx),
+            )))
+            .child(Button::new("add-triangle").label("△").small().on_click(cx.listener(
+                |this, _, window, cx| this.add_shape_element(ShapeKind::Triangle, window, cx),
+            )))
+            .child(
+                Button::new("add-icon")
+                    .label("✦ Icon")
+                    .small()
+                    .when(self.icon_picker_open, |b| b.primary())
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_icon_picker(cx))),
+            )
+            .child(
+                Button::new("remove")
+                    .label("🗑")
+                    .small()
+                    .disabled(self.builder_selected.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.remove_selected_element(cx))),
+            )
+            .into_any_element()]);
 
         let document_group = self.toolbar_group([
-            div().text_sm().child("Length").into_any_element(),
-            div().w(px(70.)).child(Input::new(&self.builder_feed_input)).into_any_element(),
-            div()
-                .text_sm()
-                .text_color(gpui::rgb(0x666666))
-                .child("dots")
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_sm().child("Length"))
+                .child(
+                    div()
+                        .w(px(70.))
+                        .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                            match event.keystroke.key.as_str() {
+                                "up" => this.step_feed_dots(1, window, cx),
+                                "down" => this.step_feed_dots(-1, window, cx),
+                                _ => {}
+                            }
+                        }))
+                        .child(Input::new(&self.builder_feed_input)),
+                )
+                .child(div().text_sm().text_color(gpui::rgb(0x666666)).ml_1().child("dots"))
                 .into_any_element(),
             h_flex()
                 .gap_1()
@@ -837,18 +840,30 @@ impl LabelApp {
                 )))
                 .child(div().text_sm().child("Invert"))
                 .into_any_element(),
-            div().text_sm().child("Contrast").into_any_element(),
-            div().w(px(100.)).child(Slider::new(&self.contrast)).into_any_element(),
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().text_sm().child("Contrast"))
+                .child(div().w(px(100.)).child(Slider::new(&self.contrast)))
+                .into_any_element(),
         ]);
 
-        let file_group = self.toolbar_group([
-            Button::new("save").label("💾 Save").small().on_click(
-                cx.listener(|this, _, window, cx| this.save_label(window, cx)),
-            ).into_any_element(),
-            Button::new("open").label("📂 Open").small().on_click(
-                cx.listener(|this, _, window, cx| this.load_label(window, cx)),
-            ).into_any_element(),
-        ]);
+        let file_group = self.toolbar_group([h_flex()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new("save")
+                    .label("💾 Save")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| this.save_label(window, cx))),
+            )
+            .child(
+                Button::new("open")
+                    .label("📂 Open")
+                    .small()
+                    .on_click(cx.listener(|this, _, window, cx| this.load_label(window, cx))),
+            )
+            .into_any_element()]);
 
         v_flex()
             .gap_2()
@@ -859,9 +874,9 @@ impl LabelApp {
             .child(h_flex().gap_3().items_center().child(insert_group).child(document_group).child(file_group))
             .child(
                 div().text_sm().text_color(gpui::rgb(0x999999)).child(format!(
-                    "Editor is zoomed in {PREVIEW_SCALE:.0}x — actual printed size is about {:.0}mm long x {:.0}mm tall (estimated; printer DPI unverified)",
-                    self.builder_feed_dots as f32 / 8.0,
-                    PRINT_HEAD_DOTS as f32 / 8.0,
+                    "Editor is zoomed in {PREVIEW_SCALE:.0}x — printable area is about {:.0}mm long x {:.0}mm tall, plus a ~10mm blank leader/trailer the printer adds to every job",
+                    self.builder_feed_dots as f32 / CROSS_DOTS_PER_MM,
+                    PRINT_HEAD_DOTS as f32 / CROSS_DOTS_PER_MM,
                 )),
             )
     }
@@ -920,16 +935,6 @@ impl LabelApp {
                                     cx.listener(|this, _, _, cx| this.toggle_selected_bold(cx)),
                                 ))
                                 .child(div().text_sm().child("Bold")),
-                        )
-                        .child(
-                            h_flex().gap_1().items_center().children(GLYPHS.iter().map(|g| {
-                                Button::new(SharedString::from(format!("glyph-{g}")))
-                                    .label(*g)
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.insert_glyph(g, window, cx)
-                                    }))
-                            })),
                         )
                 })
                 .when(matches!(el.kind, BuilderKind::Shape { .. }), |row| {
@@ -1074,14 +1079,34 @@ impl LabelApp {
     /// often than every `THROTTLE` and never while actively dragging an
     /// element — recomputing the full raster (font shaping, resize,
     /// dithering) on every single render made typing and dragging
-    /// visibly laggy. A final edit can lag up to `THROTTLE` behind in
-    /// the preview; that's a fair trade for a responsive editor.
-    fn maybe_recompute_preview(&mut self, cx: &mut Context<Self>) {
+    /// visibly laggy. When a change arrives inside the throttle window,
+    /// a single catch-up redraw is scheduled just past it so the final
+    /// state always lands, instead of staying stale until some other
+    /// edit happens to fall outside the window.
+    fn maybe_recompute_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         const THROTTLE: std::time::Duration = std::time::Duration::from_millis(400);
         if self.drag_grab.is_some() {
             return;
         }
-        if self.last_preview_compute.elapsed() < THROTTLE {
+        let elapsed = self.last_preview_compute.elapsed();
+        if elapsed < THROTTLE {
+            if !self.preview_catchup_scheduled {
+                self.preview_catchup_scheduled = true;
+                let remaining = THROTTLE - elapsed + std::time::Duration::from_millis(20);
+                cx.spawn_in(window, async move |view, window| {
+                    futures_timer::Delay::new(remaining).await;
+                    window
+                        .update(|_, cx| {
+                            view.update(cx, |this, cx| {
+                                this.preview_catchup_scheduled = false;
+                                cx.notify();
+                            })
+                            .ok();
+                        })
+                        .ok();
+                })
+                .detach();
+            }
             return;
         }
         self.last_preview_compute = std::time::Instant::now();
@@ -1096,21 +1121,18 @@ impl LabelApp {
             self.preview_cache = None;
             return;
         };
-        let preview_at = |scale: u32| {
-            label_render::preview_png(&raster, scale)
-                .ok()
-                .map(|png| Arc::new(Image::from_bytes(ImageFormat::Png, png)))
-        };
-        self.preview_cache = preview_at(1);
+        self.preview_cache = label_render::physical_preview_png(&raster, &label_render::TapeProfile::default(), 14.0)
+            .ok()
+            .map(|png| Arc::new(Image::from_bytes(ImageFormat::Png, png)));
     }
 
-    /// Renders the actual composited-and-dithered raster at 1x (true
-    /// print size — a sliver, since the tape is only ~4mm tall), so
-    /// dithering can be judged before committing it to tape. Reads from
-    /// `preview_cache`; call `maybe_recompute_preview` first to keep it
-    /// current.
+    /// Renders the actual composited-and-dithered label as it will
+    /// physically look on tape: true proportions, the printable band
+    /// centered in the full tape height, and the blank leader/trailer the
+    /// printer adds to every job. Reads from `preview_cache`; call
+    /// `maybe_recompute_preview` first to keep it current.
     fn render_dither_preview(&self, _cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let png_1x = self.preview_cache.clone()?;
+        let png = self.preview_cache.clone()?;
 
         Some(
             v_flex()
@@ -1120,22 +1142,21 @@ impl LabelApp {
                 .border_t_1()
                 .border_color(gpui::rgb(0xe5e5e5))
                 .child(div().text_sm().text_color(gpui::rgb(0x888888)).child(
-                    "Actual print preview (dithered, true size, true orientation)",
+                    "Approximate print preview",
                 ))
                 .child(
                     div()
                         .border_1()
                         .border_color(gpui::rgb(0xdddddd))
-                        .bg(gpui::white())
-                        .child(gpui_kit::img(png_1x).object_fit(ObjectFit::Contain)),
+                        .child(gpui_kit::img(png)),
                 ),
         )
     }
 }
 
 impl Render for LabelApp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.maybe_recompute_preview(cx);
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.maybe_recompute_preview(window, cx);
         h_flex()
             .size_full()
             .child(self.render_sidebar(cx))
