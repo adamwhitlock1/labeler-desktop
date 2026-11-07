@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use ab_glyph::{Font, PxScale, ScaleFont};
 use image::{imageops, GrayImage};
-use imageproc::drawing::draw_text_mut;
+use imageproc::drawing::{draw_filled_circle_mut, draw_filled_rect_mut, draw_polygon_mut, draw_text_mut};
+use imageproc::point::Point;
+use imageproc::rect::Rect;
 use label_core::Raster;
 
 use crate::{binarize, load_font, RenderError, RenderOptions, TextAlign};
@@ -17,6 +19,22 @@ use crate::{binarize, load_font, RenderError, RenderOptions, TextAlign};
 /// images keep antialiased edges after the final downscale to the
 /// printer's real dot grid.
 const SUPER: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ShapeKind {
+    Circle,
+    Square,
+    Triangle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ShapeStyle {
+    Filled,
+    /// A continuous outline, about one printed dot thick.
+    Outline,
+    /// An outline drawn as evenly spaced dots instead of a solid line.
+    Dotted,
+}
 
 #[derive(Debug, Clone)]
 pub enum ElementKind {
@@ -33,6 +51,12 @@ pub enum ElementKind {
         /// On-canvas size, in dots.
         width: f32,
         height: f32,
+    },
+    Shape {
+        shape: ShapeKind,
+        /// Bounding box side length, in dots.
+        size: f32,
+        style: ShapeStyle,
     },
 }
 
@@ -92,16 +116,24 @@ pub fn raster_from_document(
                 width,
                 height,
             } => draw_image_element(&mut canvas, path, *width, *height, sx, sy)?,
+            ElementKind::Shape { shape, size, style } => {
+                draw_shape_element(&mut canvas, *shape, *size, *style, sx, sy)
+            }
         }
     }
 
+    // `doc.feed_dots`/`doc.cross_dots` are "logical", square-pitch dots: a
+    // square laid out in the document looks square. The printer's real
+    // dot grid isn't square — its feed-direction pitch is about half its
+    // cross-feed pitch (see raster_from_dynamic_image) — so the actual
+    // raster needs roughly twice as many feed dots to cover the same
+    // physical length. Skipping this (as an earlier version did) prints
+    // everything visibly compressed along the feed direction.
+    let feed_dots_raw = (doc.feed_dots.max(1)) * 2;
+    let cross_dots = doc.cross_dots.max(1);
+
     let rotated = imageops::rotate90(&canvas);
-    let resized = imageops::resize(
-        &rotated,
-        doc.cross_dots.max(1),
-        doc.feed_dots.max(1),
-        imageops::FilterType::Lanczos3,
-    );
+    let resized = imageops::resize(&rotated, cross_dots, feed_dots_raw, imageops::FilterType::Lanczos3);
     let adjusted = if render_opts.contrast != 0.0 {
         imageops::contrast(&resized, render_opts.contrast)
     } else {
@@ -109,7 +141,7 @@ pub fn raster_from_document(
     };
 
     let bits = binarize(&adjusted, render_opts.dither, render_opts.invert);
-    Ok(Raster::new(doc.cross_dots.max(1), doc.feed_dots.max(1), bits))
+    Ok(Raster::new(cross_dots, feed_dots_raw, bits))
 }
 
 fn draw_text_element(
@@ -181,6 +213,119 @@ fn draw_image_element(
     Ok(())
 }
 
+/// Stroke width for an unfilled shape's outline, in supersampled pixels.
+/// A plain 1px outline (what imageproc's `draw_hollow_*` give you)
+/// mostly disappears once the final downscale divides by `SUPER` — this
+/// keeps about one solid dot of outline in the printed result.
+const SHAPE_STROKE: i32 = SUPER as i32;
+
+/// Spacing between dots along a dotted outline, in supersampled pixels.
+const DOT_SPACING: f32 = (SHAPE_STROKE * 3) as f32;
+
+fn draw_dots_along(canvas: &mut GrayImage, points: &[(f32, f32)], color: image::Luma<u8>) {
+    if points.len() < 2 {
+        return;
+    }
+    let r = (SHAPE_STROKE / 2).max(1);
+    let mut carry = 0.0f32;
+    for pair in points.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        let dx = x1 - x0;
+        let dy = y1 - y0;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 0.0 {
+            continue;
+        }
+        let mut dist = DOT_SPACING - carry;
+        while dist < len {
+            let t = dist / len;
+            let (px, py) = (x0 + dx * t, y0 + dy * t);
+            draw_filled_circle_mut(canvas, (px.round() as i32, py.round() as i32), r, color);
+            dist += DOT_SPACING;
+        }
+        carry = len - (dist - DOT_SPACING);
+    }
+}
+
+fn draw_shape_element(canvas: &mut GrayImage, shape: ShapeKind, size: f32, style: ShapeStyle, x: i64, y: i64) {
+    let black = image::Luma([0u8]);
+    let white = image::Luma([255u8]);
+    let s = ((size * SUPER as f32).round() as i32).max(2);
+    let (x, y) = (x as i32, y as i32);
+
+    match shape {
+        ShapeKind::Circle => {
+            let r = s / 2;
+            let center = (x + r, y + r);
+            match style {
+                ShapeStyle::Filled => draw_filled_circle_mut(canvas, center, r, black),
+                ShapeStyle::Outline => {
+                    draw_filled_circle_mut(canvas, center, r, black);
+                    if r > SHAPE_STROKE {
+                        draw_filled_circle_mut(canvas, center, r - SHAPE_STROKE, white);
+                    }
+                }
+                ShapeStyle::Dotted => {
+                    let steps = 64;
+                    let pts: Vec<(f32, f32)> = (0..=steps)
+                        .map(|i| {
+                            let a = i as f32 / steps as f32 * std::f32::consts::TAU;
+                            (center.0 as f32 + r as f32 * a.cos(), center.1 as f32 + r as f32 * a.sin())
+                        })
+                        .collect();
+                    draw_dots_along(canvas, &pts, black);
+                }
+            }
+        }
+        ShapeKind::Square => {
+            let rect = Rect::at(x, y).of_size(s as u32, s as u32);
+            match style {
+                ShapeStyle::Filled => draw_filled_rect_mut(canvas, rect, black),
+                ShapeStyle::Outline => {
+                    draw_filled_rect_mut(canvas, rect, black);
+                    if s > SHAPE_STROKE * 2 {
+                        let inner = Rect::at(x + SHAPE_STROKE, y + SHAPE_STROKE)
+                            .of_size((s - SHAPE_STROKE * 2) as u32, (s - SHAPE_STROKE * 2) as u32);
+                        draw_filled_rect_mut(canvas, inner, white);
+                    }
+                }
+                ShapeStyle::Dotted => {
+                    let (xf, yf, sf) = (x as f32, y as f32, s as f32);
+                    let corners = [(xf, yf), (xf + sf, yf), (xf + sf, yf + sf), (xf, yf + sf), (xf, yf)];
+                    draw_dots_along(canvas, &corners, black);
+                }
+            }
+        }
+        ShapeKind::Triangle => {
+            let triangle = |inset: i32| {
+                [
+                    Point::new(x + s / 2, y + inset * 2),
+                    Point::new(x + inset, y + s - 1 - inset),
+                    Point::new(x + s - 1 - inset, y + s - 1 - inset),
+                ]
+            };
+            match style {
+                ShapeStyle::Filled => draw_polygon_mut(canvas, &triangle(0), black),
+                ShapeStyle::Outline => {
+                    draw_polygon_mut(canvas, &triangle(0), black);
+                    if s > SHAPE_STROKE * 3 {
+                        draw_polygon_mut(canvas, &triangle(SHAPE_STROKE), white);
+                    }
+                }
+                ShapeStyle::Dotted => {
+                    let t = triangle(0);
+                    let pts: Vec<(f32, f32)> = [t[0], t[1], t[2], t[0]]
+                        .iter()
+                        .map(|p| (p.x as f32, p.y as f32))
+                        .collect();
+                    draw_dots_along(canvas, &pts, black);
+                }
+            }
+        }
+    }
+}
+
 /// Renders a document to a pixel-exact, human-upright PNG preview — handy
 /// for a builder UI's canvas background, same framing [`crate::preview_png`]
 /// uses for a single element.
@@ -202,7 +347,10 @@ mod tests {
         let doc = LabelDocument::new(100, 32);
         let raster = raster_from_document(&doc, &RenderOptions::default()).unwrap();
         assert_eq!(raster.cross, 32);
-        assert_eq!(raster.feed, 100);
+        // feed is doubled relative to the document's logical length to
+        // correct for the printer's non-square dot pitch (see comment in
+        // raster_from_document).
+        assert_eq!(raster.feed, 200);
         assert!(raster.bits.iter().all(|&b| !b));
     }
 

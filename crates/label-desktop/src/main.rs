@@ -16,13 +16,10 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::notification::NotificationType;
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::select::SelectEvent;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::*;
 use gpui_kit::base::Disableable;
@@ -31,26 +28,30 @@ use gpui_kit::{Image, ImageFormat, PathPromptOptions};
 use gpui_kit::*;
 use label_core::{create_job, PRINT_HEAD_DOTS};
 use label_render::document::{
-    raster_from_document, Element as DocElement, ElementKind as DocElementKind, LabelDocument,
+    raster_from_document, Element as DocElement, ElementKind as DocElementKind, LabelDocument, ShapeKind,
+    ShapeStyle,
 };
-use label_render::{
-    raster_from_dynamic_image, raster_from_text, Dither, RenderOptions, TextAlign, TextOptions,
-};
+use label_render::{Dither, RenderOptions, TextAlign};
+use serde::{Deserialize, Serialize};
 
-const DITHER_OPTIONS: [&str; 3] = ["Threshold", "Floyd-Steinberg", "Atkinson"];
-const ALIGN_OPTIONS: [&str; 3] = ["Left", "Center", "Right"];
-
-/// Preview pixels per print dot in the Builder tab's canvas.
+/// Preview pixels per print dot in the builder canvas.
 const PREVIEW_SCALE: f32 = 6.0;
-const DEFAULT_BUILDER_FEED_DOTS: u32 = 260;
+const DEFAULT_BUILDER_FEED_DOTS: u32 = 175;
+/// New text starts at 60% of the size slider's max.
+const DEFAULT_TEXT_SIZE: f32 = 46.0 * 0.6;
 
-#[derive(Clone)]
+/// Quick-insert palette for the text tool: plain Unicode symbols the
+/// system font already renders, no icon font required.
+const GLYPHS: [&str; 10] = ["★", "♥", "✓", "✗", "●", "■", "▲", "→", "☀", "⚠"];
+
+#[derive(Clone, Serialize, Deserialize)]
 enum BuilderKind {
     Text { text: String, size: f32, bold: bool },
     Image { path: PathBuf, width: f32, height: f32, aspect: f32 },
+    Shape { shape: ShapeKind, size: f32, style: ShapeStyle },
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct BuilderElement {
     id: u64,
     /// Top-left, in preview pixels (canvas-local).
@@ -59,21 +60,12 @@ struct BuilderElement {
     kind: BuilderKind,
 }
 
-fn dither_from_label(label: &str) -> Dither {
-    match label {
-        "Floyd-Steinberg" => Dither::FloydSteinberg,
-        "Atkinson" => Dither::Atkinson,
-        _ => Dither::Threshold(128),
-    }
+#[derive(Serialize, Deserialize)]
+struct SavedLabel {
+    feed_dots: u32,
+    elements: Vec<BuilderElement>,
 }
 
-fn align_from_label(label: &str) -> TextAlign {
-    match label {
-        "Center" => TextAlign::Center,
-        "Right" => TextAlign::Right,
-        _ => TextAlign::Left,
-    }
-}
 
 struct LabelApp {
     // device
@@ -82,114 +74,61 @@ struct LabelApp {
     device_id: Option<String>,
     device_name: Option<String>,
 
-    // tabs
-    active_tab: usize,
-
-    // text options
-    text_input: Entity<InputState>,
-    bold: bool,
-    frame: bool,
-    text_align: Entity<SelectState<Vec<String>>>,
-    font_size: Entity<SliderState>,
-
-    // image options
-    image_path: Option<PathBuf>,
+    // whole-document render options
     contrast: Entity<SliderState>,
-
-    // shared
-    dither: Entity<SelectState<Vec<String>>>,
     invert: bool,
     copies: u32,
-
-    // preview
-    preview_png: Option<Arc<Image>>,
-    feed_dots: u32,
-
     printing: bool,
 
-    // builder tab
+    // builder
     builder_elements: Vec<BuilderElement>,
     builder_selected: Option<u64>,
     builder_next_id: u64,
     builder_feed_dots: u32,
-    builder_feed_slider: Entity<SliderState>,
+    builder_feed_input: Entity<InputState>,
     builder_text_edit: Entity<InputState>,
     builder_size_slider: Entity<SliderState>,
     builder_bold: bool,
+    builder_shape_style: ShapeStyle,
     canvas_origin: Rc<Cell<Point<Pixels>>>,
     /// (element id, grab offset within the element, in canvas-local px)
     drag_grab: Option<(u64, f32, f32)>,
+    /// Horizontal pan offset of the canvas viewport, in preview px. Driven
+    /// by `on_scroll_wheel` directly — the library's `overflow_x_scrollbar`
+    /// never actually scrolled here (nested every way tried), so this
+    /// panning is self-managed instead of relying on it.
+    builder_scroll_x: f32,
+    /// Cached (1x, 3x) dithered print preview, refreshed by
+    /// `maybe_recompute_preview` on a throttle instead of every render —
+    /// the full raster/dither pass is expensive enough (font shaping,
+    /// resize, dithering) that doing it on every keystroke or drag-move
+    /// made typing and dragging visibly laggy.
+    preview_cache: Option<Arc<Image>>,
+    last_preview_compute: std::time::Instant,
 
     _subscriptions: Vec<Subscription>,
 }
 
 impl LabelApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let text_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("Type your label text...")
-                .default_value("Hello World")
-        });
-        let text_align = cx.new(|cx| {
-            SelectState::new(
-                ALIGN_OPTIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                Some(IndexPath::default()),
-                window,
-                cx,
-            )
-        });
-        let dither = cx.new(|cx| {
-            SelectState::new(
-                DITHER_OPTIONS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                Some(IndexPath::default()),
-                window,
-                cx,
-            )
-        });
-        let font_size = cx.new(|_| {
-            SliderState::new().min(16.0).max(160.0).default_value(64.0).step(1.0)
-        });
         let contrast = cx.new(|_| {
             SliderState::new().min(-100.0).max(100.0).default_value(0.0).step(1.0)
         });
-        let builder_feed_slider = cx.new(|_| {
-            SliderState::new()
-                .min(60.0)
-                .max(800.0)
-                .default_value(DEFAULT_BUILDER_FEED_DOTS as f32)
-                .step(10.0)
+        let builder_feed_input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(DEFAULT_BUILDER_FEED_DOTS.to_string())
         });
         let builder_text_edit = cx.new(|cx| InputState::new(window, cx).placeholder("Text..."));
         let builder_size_slider = cx.new(|_| {
-            SliderState::new().min(6.0).max(32.0).default_value(14.0).step(1.0)
+            // Shared by text, image and shape elements. Well over the
+            // tape's physical 32-dot height: sizing past that (or
+            // dragging past the edge) is the user's call.
+            SliderState::new().min(6.0).max(46.0).default_value(DEFAULT_TEXT_SIZE).step(1.0)
         });
 
         let mut subs = Vec::new();
-        subs.push(cx.subscribe(&text_input, |this, _, event, cx| {
+        subs.push(cx.subscribe(&builder_feed_input, |this, _, event, cx| {
             if matches!(event, InputEvent::Change) {
-                this.rebuild_preview(cx);
-            }
-        }));
-        subs.push(cx.subscribe(&text_align, |this, _, _event: &SelectEvent<Vec<String>>, cx| {
-            this.rebuild_preview(cx);
-        }));
-        subs.push(cx.subscribe(&dither, |this, _, _event: &SelectEvent<Vec<String>>, cx| {
-            this.rebuild_preview(cx);
-        }));
-        subs.push(cx.subscribe(&font_size, |this, _, event, cx| {
-            if let SliderEvent::Change(_) = event {
-                this.rebuild_preview(cx);
-            }
-        }));
-        subs.push(cx.subscribe(&contrast, |this, _, event, cx| {
-            if let SliderEvent::Change(_) = event {
-                this.rebuild_preview(cx);
-            }
-        }));
-        subs.push(cx.subscribe(&builder_feed_slider, |this, _, event, cx| {
-            if let SliderEvent::Change(v) = event {
-                this.builder_feed_dots = v.start().round() as u32;
-                cx.notify();
+                this.update_feed_dots(cx);
             }
         }));
         subs.push(cx.subscribe(&builder_text_edit, |this, _, event, cx| {
@@ -203,148 +142,57 @@ impl LabelApp {
             }
         }));
 
-        let mut app = Self {
+        Self {
             scanning: false,
             found: Vec::new(),
             device_id: None,
             device_name: None,
-            active_tab: 0,
-            text_input,
-            bold: false,
-            frame: false,
-            text_align,
-            font_size,
-            image_path: None,
             contrast,
-            dither,
             invert: false,
             copies: 1,
-            preview_png: None,
-            feed_dots: 0,
             printing: false,
             builder_elements: Vec::new(),
             builder_selected: None,
             builder_next_id: 1,
             builder_feed_dots: DEFAULT_BUILDER_FEED_DOTS,
-            builder_feed_slider,
+            builder_feed_input,
             builder_text_edit,
             builder_size_slider,
             builder_bold: false,
+            builder_shape_style: ShapeStyle::Filled,
             canvas_origin: Rc::new(Cell::new(Point::default())),
             drag_grab: None,
+            builder_scroll_x: 0.0,
+            preview_cache: None,
+            last_preview_compute: std::time::Instant::now() - std::time::Duration::from_secs(1),
             _subscriptions: subs,
-        };
-        app.rebuild_preview(cx);
-        app
+        }
     }
 
     fn render_opts(&self, cx: &App) -> RenderOptions {
-        let dither_label = self
-            .dither
-            .read(cx)
-            .selected_value()
-            .cloned()
-            .unwrap_or_else(|| "Threshold".to_string());
         RenderOptions {
-            dither: dither_from_label(&dither_label),
+            dither: Dither::Threshold(128),
             invert: self.invert,
             contrast: self.contrast.read(cx).value().start(),
             ..Default::default()
         }
     }
 
-    fn rebuild_preview(&mut self, cx: &mut Context<Self>) {
-        if self.active_tab == 2 {
-            self.feed_dots = self.builder_feed_dots;
-            self.preview_png = None;
-            cx.notify();
-            return;
-        }
-        let render_opts = self.render_opts(cx);
-        let raster = if self.active_tab == 0 {
-            let text = self.text_input.read(cx).value().to_string();
-            if text.trim().is_empty() {
-                self.preview_png = None;
-                self.feed_dots = 0;
-                cx.notify();
-                return;
-            }
-            let align_label = self
-                .text_align
-                .read(cx)
-                .selected_value()
-                .cloned()
-                .unwrap_or_else(|| "Left".to_string());
-            let text_opts = TextOptions {
-                font_path: None,
-                bold: self.bold,
-                size: self.font_size.read(cx).value().start(),
-                align: align_from_label(&align_label),
-                frame: self.frame,
-            };
-            let lines: Vec<&str> = text.lines().collect();
-            match raster_from_text(&lines, &text_opts, &render_opts) {
-                Ok(r) => r,
-                Err(_) => {
-                    self.preview_png = None;
-                    cx.notify();
-                    return;
-                }
-            }
-        } else {
-            let Some(path) = &self.image_path else {
-                self.preview_png = None;
-                self.feed_dots = 0;
-                cx.notify();
-                return;
-            };
-            match image::open(path) {
-                Ok(img) => raster_from_dynamic_image(&img, &render_opts),
-                Err(_) => {
-                    self.preview_png = None;
-                    cx.notify();
-                    return;
-                }
-            }
-        };
-
-        self.feed_dots = raster.feed;
-        if let Ok(png) = label_render::preview_png(&raster, 4) {
-            self.preview_png = Some(Arc::new(Image::from_bytes(ImageFormat::Png, png)));
+    fn update_feed_dots(&mut self, cx: &mut Context<Self>) {
+        let text = self.builder_feed_input.read(cx).value().to_string();
+        if let Ok(dots) = text.trim().parse::<u32>() {
+            self.builder_feed_dots = dots.clamp(10, 2000);
         }
         cx.notify();
     }
 
     fn current_job(&self, cx: &App) -> Option<Vec<Vec<u8>>> {
-        let render_opts = self.render_opts(cx);
-        if self.active_tab == 2 {
-            if self.builder_elements.is_empty() {
-                return None;
-            }
-            let doc = self.builder_document();
-            let raster = raster_from_document(&doc, &render_opts).ok()?;
-            return Some(create_job(&raster));
+        if self.builder_elements.is_empty() {
+            return None;
         }
-        let raster = if self.active_tab == 0 {
-            let text = self.text_input.read(cx).value().to_string();
-            if text.trim().is_empty() {
-                return None;
-            }
-            let align_label = self.text_align.read(cx).selected_value().cloned().unwrap_or_default();
-            let text_opts = TextOptions {
-                font_path: None,
-                bold: self.bold,
-                size: self.font_size.read(cx).value().start(),
-                align: align_from_label(&align_label),
-                frame: self.frame,
-            };
-            let lines: Vec<&str> = text.lines().collect();
-            raster_from_text(&lines, &text_opts, &render_opts).ok()?
-        } else {
-            let path = self.image_path.as_ref()?;
-            let img = image::open(path).ok()?;
-            raster_from_dynamic_image(&img, &render_opts)
-        };
+        let render_opts = self.render_opts(cx);
+        let doc = self.builder_document();
+        let raster = raster_from_document(&doc, &render_opts).ok()?;
         Some(create_job(&raster))
     }
 
@@ -380,35 +228,6 @@ impl LabelApp {
         cx.notify();
     }
 
-    fn pick_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some("Select an image".into()),
-        });
-        cx.spawn_in(window, async move |view, window| {
-            let Some(path) = paths
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten()
-                .and_then(|p| p.into_iter().next())
-            else {
-                return;
-            };
-            window
-                .update(|_, cx| {
-                    view.update(cx, |this, cx| {
-                        this.image_path = Some(path);
-                        this.rebuild_preview(cx);
-                    })
-                    .ok();
-                })
-                .ok();
-        })
-        .detach();
-    }
 
     fn selected_element(&self) -> Option<&BuilderElement> {
         let id = self.builder_selected?;
@@ -435,6 +254,13 @@ impl LabelApp {
                         s.set_value(height, window, cx);
                     });
                 }
+                BuilderKind::Shape { size, style, .. } => {
+                    let (size, style) = (*size, *style);
+                    self.builder_size_slider.update(cx, |s, cx| {
+                        s.set_value(size, window, cx);
+                    });
+                    self.builder_shape_style = style;
+                }
             }
         }
         cx.notify();
@@ -451,6 +277,23 @@ impl LabelApp {
         cx.notify();
     }
 
+    /// Appends a glyph to the selected text element, via the shared
+    /// quick-insert palette. These are plain Unicode symbols rendered by
+    /// the same system font already in use — no icon font needed for
+    /// simple shapes/marks; a real icon set (Font Awesome et al.) is a
+    /// separate addition if more coverage is ever needed.
+    fn insert_glyph(&mut self, glyph: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.selected_element().map(|e| &e.kind), Some(BuilderKind::Text { .. })) {
+            return;
+        }
+        let mut text = self.builder_text_edit.read(cx).value().to_string();
+        text.push_str(glyph);
+        self.builder_text_edit.update(cx, |s, cx| {
+            s.set_value(text, window, cx);
+        });
+        self.update_selected_text(cx);
+    }
+
     fn update_selected_size(&mut self, value: f32, cx: &mut Context<Self>) {
         let Some(id) = self.builder_selected else { return };
         if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
@@ -460,6 +303,7 @@ impl LabelApp {
                     *height = value;
                     *width = value * *aspect;
                 }
+                BuilderKind::Shape { size, .. } => *size = value,
             }
         }
         cx.notify();
@@ -477,6 +321,29 @@ impl LabelApp {
         cx.notify();
     }
 
+    fn set_selected_shape_style(&mut self, style: ShapeStyle, cx: &mut Context<Self>) {
+        let Some(id) = self.builder_selected else { return };
+        self.builder_shape_style = style;
+        if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
+            if let BuilderKind::Shape { style: s, .. } = &mut el.kind {
+                *s = style;
+            }
+        }
+        cx.notify();
+    }
+
+    fn add_shape_element(&mut self, shape: ShapeKind, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.builder_next_id;
+        self.builder_next_id += 1;
+        self.builder_elements.push(BuilderElement {
+            id,
+            x: 10.0,
+            y: 4.0,
+            kind: BuilderKind::Shape { shape, size: 20.0, style: ShapeStyle::Filled },
+        });
+        self.select_element(id, window, cx);
+    }
+
     fn add_text_element(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.builder_next_id;
         self.builder_next_id += 1;
@@ -486,7 +353,7 @@ impl LabelApp {
             y: 10.0,
             kind: BuilderKind::Text {
                 text: "Text".to_string(),
-                size: 14.0,
+                size: DEFAULT_TEXT_SIZE,
                 bold: false,
             },
         });
@@ -545,6 +412,20 @@ impl LabelApp {
         cx.notify();
     }
 
+    fn center_selected_vertically(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.builder_selected else { return };
+        let canvas_h = PRINT_HEAD_DOTS as f32 * PREVIEW_SCALE;
+        if let Some(el) = self.builder_elements.iter_mut().find(|e| e.id == id) {
+            let el_h = match &el.kind {
+                BuilderKind::Text { size, .. } => *size * PREVIEW_SCALE,
+                BuilderKind::Image { height, .. } => *height * PREVIEW_SCALE,
+                BuilderKind::Shape { size, .. } => *size * PREVIEW_SCALE,
+            };
+            el.y = ((canvas_h - el_h) / 2.0).max(0.0);
+        }
+        cx.notify();
+    }
+
     fn builder_document(&self) -> LabelDocument {
         let mut doc = LabelDocument::new(self.builder_feed_dots, PRINT_HEAD_DOTS);
         for el in &self.builder_elements {
@@ -560,6 +441,11 @@ impl LabelApp {
                     width: *width,
                     height: *height,
                 },
+                BuilderKind::Shape { shape, size, style } => DocElementKind::Shape {
+                    shape: *shape,
+                    size: *size,
+                    style: *style,
+                },
             };
             doc.elements.push(DocElement {
                 id: el.id,
@@ -569,6 +455,77 @@ impl LabelApp {
             });
         }
         doc
+    }
+
+    fn save_label(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let path_task = cx.prompt_for_new_path(&dir, Some("label.json"));
+        let saved = SavedLabel {
+            feed_dots: self.builder_feed_dots,
+            elements: self.builder_elements.clone(),
+        };
+        cx.spawn_in(window, async move |_view, window| {
+            let Some(path) = path_task.await.ok().and_then(|r| r.ok()).flatten() else {
+                return;
+            };
+            let result = serde_json::to_string_pretty(&saved)
+                .map_err(|e| e.to_string())
+                .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()));
+            window
+                .update(|window, cx| match result {
+                    Ok(()) => window.push_notification((NotificationType::Success, "Label saved."), cx),
+                    Err(e) => {
+                        window.push_notification((NotificationType::Error, format!("Save failed: {e}")), cx)
+                    }
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn load_label(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open a saved label".into()),
+        });
+        cx.spawn_in(window, async move |view, window| {
+            let Some(path) = paths
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .and_then(|p| p.into_iter().next())
+            else {
+                return;
+            };
+            let loaded = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<SavedLabel>(&s).ok());
+            window
+                .update(|window, cx| {
+                    let Some(saved) = loaded else {
+                        window.push_notification((NotificationType::Error, "Could not load that file."), cx);
+                        return;
+                    };
+                    view.update(cx, |this, cx| {
+                        let max_id = saved.elements.iter().map(|e| e.id).max().unwrap_or(0);
+                        this.builder_elements = saved.elements;
+                        this.builder_next_id = max_id + 1;
+                        this.builder_selected = None;
+                        this.builder_feed_dots = saved.feed_dots;
+                        this.builder_feed_input.update(cx, |s, cx| {
+                            s.set_value(saved.feed_dots.to_string(), window, cx);
+                        });
+                        cx.notify();
+                    })
+                    .ok();
+                    window.push_notification((NotificationType::Success, "Label loaded."), cx);
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn print(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -666,82 +623,6 @@ impl LabelApp {
             )
     }
 
-    fn render_text_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .gap_3()
-            .child(Input::new(&self.text_input).cleanable(true))
-            .child(
-                h_flex()
-                    .gap_4()
-                    .items_center()
-                    .child(div().text_sm().child("Size"))
-                    .child(div().w(px(160.)).child(Slider::new(&self.font_size)))
-                    .child(div().text_sm().child(format!("{:.0}px", self.font_size.read(cx).value().start())))
-                    .child(
-                        div().w(px(140.)).child(
-                            Select::new(&self.text_align).placeholder("Align"),
-                        ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .items_center()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(Switch::new("bold").checked(self.bold).on_change(cx.listener(
-                                |this, checked, _, cx| {
-                                    this.bold = *checked;
-                                    this.rebuild_preview(cx);
-                                },
-                            )))
-                            .child("Bold"),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(Switch::new("frame").checked(self.frame).on_change(cx.listener(
-                                |this, checked, _, cx| {
-                                    this.frame = *checked;
-                                    this.rebuild_preview(cx);
-                                },
-                            )))
-                            .child("Frame"),
-                    ),
-            )
-    }
-
-    fn render_image_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex()
-            .gap_3()
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(Button::new("load").label("Load Image...").on_click(cx.listener(
-                        |this, _, window, cx| this.pick_image(window, cx),
-                    )))
-                    .child(div().text_sm().child(
-                        self.image_path
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "No image loaded".into()),
-                    )),
-            )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .items_center()
-                    .child(div().text_sm().child("Contrast"))
-                    .child(div().w(px(160.)).child(Slider::new(&self.contrast)))
-                    .child(div().text_sm().child(format!("{:.0}", self.contrast.read(cx).value().start()))),
-            )
-    }
-
     fn render_builder_element(&self, el: &BuilderElement, cx: &mut Context<Self>) -> impl IntoElement {
         let id = el.id;
         let (ex, ey) = (el.x, el.y);
@@ -750,6 +631,12 @@ impl LabelApp {
         let content: AnyElement = match &el.kind {
             BuilderKind::Text { text, size, bold } => div()
                 .text_size(px(*size * PREVIEW_SCALE))
+                // Tight, 1:1 line height: GPUI's default leading made the
+                // element's bounding box noticeably taller than the glyphs
+                // themselves, which made vertically centering text in the
+                // (very short) cross-feed direction guesswork.
+                .line_height(px(*size * PREVIEW_SCALE))
+                .h(px(*size * PREVIEW_SCALE))
                 .when(*bold, |d| d.font_weight(gpui::FontWeight::BOLD))
                 .child(if text.is_empty() {
                     " ".to_string()
@@ -767,6 +654,44 @@ impl LabelApp {
                         .object_fit(ObjectFit::Contain),
                 )
                 .into_any_element(),
+            BuilderKind::Shape { shape, size, style } => {
+                let s = *size * PREVIEW_SCALE;
+                let filled = *style == ShapeStyle::Filled;
+                let dotted = *style == ShapeStyle::Dotted;
+                match shape {
+                    ShapeKind::Circle => div()
+                        .w(px(s))
+                        .h(px(s))
+                        .rounded_full()
+                        .when(filled, |d| d.bg(gpui::black()))
+                        .when(!filled, |d| {
+                            d.border_2().border_color(gpui::black()).when(dotted, |d| d.border_dashed())
+                        })
+                        .into_any_element(),
+                    ShapeKind::Square => div()
+                        .w(px(s))
+                        .h(px(s))
+                        .when(filled, |d| d.bg(gpui::black()))
+                        .when(!filled, |d| {
+                            d.border_2().border_color(gpui::black()).when(dotted, |d| d.border_dashed())
+                        })
+                        .into_any_element(),
+                    ShapeKind::Triangle => div()
+                        .w(px(s))
+                        .h(px(s))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(s))
+                        .line_height(px(s))
+                        .child(match style {
+                            ShapeStyle::Filled => "▲",
+                            ShapeStyle::Outline => "△",
+                            ShapeStyle::Dotted => "△",
+                        })
+                        .into_any_element(),
+                }
+            }
         };
 
         div()
@@ -792,176 +717,346 @@ impl LabelApp {
             .child(content)
     }
 
-    fn render_builder_tab(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let canvas_w = self.builder_feed_dots as f32 * PREVIEW_SCALE;
-        let canvas_h = PRINT_HEAD_DOTS as f32 * PREVIEW_SCALE;
-        let origin_cell = self.canvas_origin.clone();
+    /// A visually distinct card grouping a few related toolbar controls,
+    /// so the toolbar reads as sections (Insert / Document / File)
+    /// instead of one long undifferentiated row of buttons.
+    fn toolbar_group(&self, children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
+        h_flex()
+            .gap_2()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(gpui::rgb(0xf0f0f0))
+            .children(children)
+    }
+
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let insert_group = self.toolbar_group([
+            Button::new("add-text")
+                .label("T  Text")
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| this.add_text_element(window, cx)))
+                .into_any_element(),
+            Button::new("add-image")
+                .label("🖼 Image")
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| this.add_image_element(window, cx)))
+                .into_any_element(),
+            Button::new("add-circle")
+                .label("○")
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_shape_element(ShapeKind::Circle, window, cx)
+                }))
+                .into_any_element(),
+            Button::new("add-square")
+                .label("□")
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_shape_element(ShapeKind::Square, window, cx)
+                }))
+                .into_any_element(),
+            Button::new("add-triangle")
+                .label("△")
+                .small()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.add_shape_element(ShapeKind::Triangle, window, cx)
+                }))
+                .into_any_element(),
+            Button::new("remove")
+                .label("🗑")
+                .small()
+                .disabled(self.builder_selected.is_none())
+                .on_click(cx.listener(|this, _, _, cx| this.remove_selected_element(cx)))
+                .into_any_element(),
+        ]);
+
+        let document_group = self.toolbar_group([
+            div().text_sm().child("Length").into_any_element(),
+            div().w(px(70.)).child(Input::new(&self.builder_feed_input)).into_any_element(),
+            div()
+                .text_sm()
+                .text_color(gpui::rgb(0x666666))
+                .child("dots")
+                .into_any_element(),
+            h_flex()
+                .gap_1()
+                .items_center()
+                .child(Switch::new("invert").checked(self.invert).on_change(cx.listener(
+                    |this, checked, _, cx| {
+                        this.invert = *checked;
+                        cx.notify();
+                    },
+                )))
+                .child(div().text_sm().child("Invert"))
+                .into_any_element(),
+            div().text_sm().child("Contrast").into_any_element(),
+            div().w(px(100.)).child(Slider::new(&self.contrast)).into_any_element(),
+        ]);
+
+        let file_group = self.toolbar_group([
+            Button::new("save").label("💾 Save").small().on_click(
+                cx.listener(|this, _, window, cx| this.save_label(window, cx)),
+            ).into_any_element(),
+            Button::new("open").label("📂 Open").small().on_click(
+                cx.listener(|this, _, window, cx| this.load_label(window, cx)),
+            ).into_any_element(),
+        ]);
 
         v_flex()
-            .gap_3()
+            .gap_2()
+            .p_3()
+            .bg(gpui::rgb(0xfafafa))
+            .border_b_1()
+            .border_color(gpui::rgb(0xe5e5e5))
+            .child(h_flex().gap_3().items_center().child(insert_group).child(document_group).child(file_group))
             .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(Button::new("add-text").label("Add Text").on_click(
-                        cx.listener(|this, _, window, cx| this.add_text_element(window, cx)),
-                    ))
-                    .child(Button::new("add-image").label("Add Image...").on_click(
-                        cx.listener(|this, _, window, cx| this.add_image_element(window, cx)),
-                    ))
-                    .child(
-                        Button::new("remove")
-                            .label("Remove")
-                            .disabled(self.builder_selected.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| this.remove_selected_element(cx))),
-                    )
-                    .child(div().text_sm().child("Label length"))
-                    .child(div().w(px(140.)).child(Slider::new(&self.builder_feed_slider)))
-                    .child(div().text_sm().child(format!("{} dots", self.builder_feed_dots))),
-            )
-            .child(
-                div().text_sm().text_color(gpui::rgb(0x888888)).child(format!(
+                div().text_sm().text_color(gpui::rgb(0x999999)).child(format!(
                     "Editor is zoomed in {PREVIEW_SCALE:.0}x — actual printed size is about {:.0}mm long x {:.0}mm tall (estimated; printer DPI unverified)",
                     self.builder_feed_dots as f32 / 8.0,
                     PRINT_HEAD_DOTS as f32 / 8.0,
                 )),
             )
-            .when_some(self.selected_element().cloned(), |flex, el| {
-                flex.child(
-                    h_flex()
-                        .gap_4()
-                        .items_center()
-                        .p_2()
-                        .bg(gpui::rgb(0xf5f5f5))
-                        .when(matches!(el.kind, BuilderKind::Text { .. }), |row| {
-                            row.child(div().w(px(220.)).child(Input::new(&self.builder_text_edit)))
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .items_center()
-                                        .child(Switch::new("builder-bold").checked(self.builder_bold).on_change(
-                                            cx.listener(|this, _, _, cx| this.toggle_selected_bold(cx)),
-                                        ))
-                                        .child("Bold"),
-                                )
-                        })
-                        .child(div().text_sm().child("Size"))
-                        .child(div().w(px(140.)).child(Slider::new(&self.builder_size_slider))),
-                )
-            })
+    }
+
+    fn render_property_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let el = self.selected_element()?.clone();
+        Some(
+            h_flex()
+                .gap_4()
+                .items_center()
+                .px_3()
+                .py_2()
+                .bg(gpui::rgb(0xeef2ff))
+                .border_b_1()
+                .border_color(gpui::rgb(0xe0e5f5))
+                .when(matches!(el.kind, BuilderKind::Text { .. }), |row| {
+                    row.child(div().w(px(200.)).child(Input::new(&self.builder_text_edit)))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(Switch::new("builder-bold").checked(self.builder_bold).on_change(
+                                    cx.listener(|this, _, _, cx| this.toggle_selected_bold(cx)),
+                                ))
+                                .child(div().text_sm().child("Bold")),
+                        )
+                        .child(
+                            h_flex().gap_1().items_center().children(GLYPHS.iter().map(|g| {
+                                Button::new(SharedString::from(format!("glyph-{g}")))
+                                    .label(*g)
+                                    .xsmall()
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.insert_glyph(g, window, cx)
+                                    }))
+                            })),
+                        )
+                })
+                .when(matches!(el.kind, BuilderKind::Shape { .. }), |row| {
+                    let style = self.builder_shape_style;
+                    row.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                Button::new("style-filled")
+                                    .label("Filled")
+                                    .xsmall()
+                                    .when(style == ShapeStyle::Filled, |b| b.primary())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_selected_shape_style(ShapeStyle::Filled, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("style-outline")
+                                    .label("Outline")
+                                    .xsmall()
+                                    .when(style == ShapeStyle::Outline, |b| b.primary())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_selected_shape_style(ShapeStyle::Outline, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("style-dotted")
+                                    .label("Dotted")
+                                    .xsmall()
+                                    .when(style == ShapeStyle::Dotted, |b| b.primary())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_selected_shape_style(ShapeStyle::Dotted, cx)
+                                    })),
+                            ),
+                    )
+                })
+                .child(div().text_sm().child("Size"))
+                .child(div().w(px(120.)).child(Slider::new(&self.builder_size_slider)))
+                .child(
+                    Button::new("center-v")
+                        .label("Center Vertically")
+                        .small()
+                        .on_click(cx.listener(|this, _, _, cx| this.center_selected_vertically(cx))),
+                ),
+        )
+    }
+
+    fn render_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let canvas_w = self.builder_feed_dots as f32 * PREVIEW_SCALE;
+        let canvas_h = PRINT_HEAD_DOTS as f32 * PREVIEW_SCALE;
+        let origin_cell = self.canvas_origin.clone();
+        let scroll_x = self.builder_scroll_x;
+
+        div()
+            .flex_1()
+            .w_full()
+            .overflow_hidden()
+            .p_6()
+            .bg(gpui::rgb(0xf5f5f7))
+            // Self-managed horizontal pan: gpui-component's
+            // `overflow_x_scrollbar()` never actually scrolled here no
+            // matter how it was nested, so this drives the offset
+            // directly off wheel/trackpad events instead.
+            .on_scroll(cx.listener(
+                move |this, event: &gpui_kit::ScrollEvent, window, cx| {
+                    let delta = event.delta.pixel_delta(window.line_height());
+                    let raw = if f32::from(delta.x) != 0.0 { delta.x } else { delta.y };
+                    let canvas_w = this.builder_feed_dots as f32 * PREVIEW_SCALE;
+                    this.builder_scroll_x = (this.builder_scroll_x - f32::from(raw)).clamp(0.0, canvas_w);
+                    cx.notify();
+                },
+            ))
             .child(
                 div()
-                    .overflow_x_scrollbar()
-                    .w_full()
-                    .child(
-                        div()
-                            .id("builder-canvas")
-                            .relative()
-                            .w(px(canvas_w))
-                            .h(px(canvas_h))
-                            .bg(gpui::white())
-                            .border_1()
-                            .border_color(gpui::rgb(0xcccccc))
-                            .on_mouse_move(cx.listener(
-                                |this, event: &gpui_kit::MouseMoveEvent, _window, cx| {
-                                    let Some((id, dx, dy)) = this.drag_grab else {
-                                        return;
-                                    };
-                                    let origin = this.canvas_origin.get();
-                                    let local_x = f32::from(event.position.x - origin.x);
-                                    let local_y = f32::from(event.position.y - origin.y);
-                                    if let Some(el) = this.builder_elements.iter_mut().find(|e| e.id == id) {
-                                        el.x = (local_x - dx).max(0.0);
-                                        el.y = (local_y - dy).max(0.0);
-                                    }
-                                    cx.notify();
-                                },
-                            ))
-                            .on_mouse_up(
-                                gpui_kit::MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.drag_grab = None;
-                                    cx.notify();
-                                }),
-                            )
-                            .on_mouse_up_out(
-                                gpui_kit::MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.drag_grab = None;
-                                    cx.notify();
-                                }),
-                            )
-                            .child(gpui_kit::canvas(
-                                move |bounds, _window, _cx| {
-                                    origin_cell.set(bounds.origin);
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full())
-                            .children(
-                                self.builder_elements
-                                    .iter()
-                                    .map(|el| self.render_builder_element(el, cx).into_any_element()),
-                            ),
+                    .id("builder-canvas")
+                    .relative()
+                    .ml(px(-scroll_x))
+                    .w(px(canvas_w))
+                    .h(px(canvas_h))
+                    .flex_shrink_0()
+                    .bg(gpui::white())
+                    .border_2()
+                    .border_color(gpui::rgb(0xb0b0b0))
+                    .shadow_md()
+                    .on_mouse_move(cx.listener(
+                        |this, event: &gpui_kit::MouseMoveEvent, _window, cx| {
+                            let Some((id, dx, dy)) = this.drag_grab else {
+                                return;
+                            };
+                            let origin = this.canvas_origin.get();
+                            let local_x = f32::from(event.position.x - origin.x);
+                            let local_y = f32::from(event.position.y - origin.y);
+                            let canvas_h = PRINT_HEAD_DOTS as f32 * PREVIEW_SCALE;
+                            if let Some(el) = this.builder_elements.iter_mut().find(|e| e.id == id) {
+                                let el_h = match &el.kind {
+                                    BuilderKind::Text { size, .. } => *size * PREVIEW_SCALE,
+                                    BuilderKind::Image { height, .. } => *height * PREVIEW_SCALE,
+                                    BuilderKind::Shape { size, .. } => *size * PREVIEW_SCALE,
+                                };
+                                // Only the element's own midpoint is
+                                // kept on the tape; it can overhang
+                                // the top/bottom edge freely, same
+                                // as oversizing it is the user's call.
+                                el.x = (local_x - dx).max(0.0);
+                                el.y = (local_y - dy).clamp(-el_h / 2.0, canvas_h - el_h / 2.0);
+                            }
+                            cx.notify();
+                        },
+                    ))
+                    .on_mouse_up(
+                        gpui_kit::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.drag_grab = None;
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up_out(
+                        gpui_kit::MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.drag_grab = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(gpui_kit::canvas(
+                        move |bounds, _window, _cx| {
+                            origin_cell.set(bounds.origin);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full())
+                    .children(
+                        self.builder_elements
+                            .iter()
+                            .map(|el| self.render_builder_element(el, cx).into_any_element()),
                     ),
             )
     }
 
-    fn render_shared_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .gap_4()
-            .items_center()
-            .child(div().text_sm().child("Dither"))
-            .child(div().w(px(160.)).child(Select::new(&self.dither)))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Switch::new("invert").checked(self.invert).on_change(cx.listener(
-                        |this, checked, _, cx| {
-                            this.invert = *checked;
-                            this.rebuild_preview(cx);
-                        },
-                    )))
-                    .child("Invert"),
-            )
+    /// Refreshes `preview_cache` from the current document, but no more
+    /// often than every `THROTTLE` and never while actively dragging an
+    /// element — recomputing the full raster (font shaping, resize,
+    /// dithering) on every single render made typing and dragging
+    /// visibly laggy. A final edit can lag up to `THROTTLE` behind in
+    /// the preview; that's a fair trade for a responsive editor.
+    fn maybe_recompute_preview(&mut self, cx: &mut Context<Self>) {
+        const THROTTLE: std::time::Duration = std::time::Duration::from_millis(400);
+        if self.drag_grab.is_some() {
+            return;
+        }
+        if self.last_preview_compute.elapsed() < THROTTLE {
+            return;
+        }
+        self.last_preview_compute = std::time::Instant::now();
+
+        if self.builder_elements.is_empty() {
+            self.preview_cache = None;
+            return;
+        }
+        let render_opts = self.render_opts(cx);
+        let doc = self.builder_document();
+        let Ok(raster) = raster_from_document(&doc, &render_opts) else {
+            self.preview_cache = None;
+            return;
+        };
+        let preview_at = |scale: u32| {
+            label_render::preview_png(&raster, scale)
+                .ok()
+                .map(|png| Arc::new(Image::from_bytes(ImageFormat::Png, png)))
+        };
+        self.preview_cache = preview_at(1);
     }
 
-    fn render_preview(&self, _cx: &mut Context<Self>) -> impl IntoElement {
-        let mm = self.feed_dots as f32 / 8.0; // rough estimate; printer's exact feed DPI is unverified
-        v_flex()
-            .flex_1()
-            .h_full()
-            .p_4()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .bg(gpui::rgb(0xfafafa))
-            .child(match &self.preview_png {
-                Some(img) => div()
-                    .border_1()
-                    .border_color(gpui::rgb(0xdddddd))
-                    .bg(gpui::white())
-                    .child(
-                        gpui_kit::img(img.clone())
-                            .object_fit(ObjectFit::Contain)
-                            .max_h(px(400.)),
-                    )
-                    .into_any_element(),
-                None => div().text_color(gpui::rgb(0x999999)).child("Nothing to preview").into_any_element(),
-            })
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(gpui::rgb(0x888888))
-                    .child(format!("~{:.0} dots long (~{mm:.0}mm, estimated)", self.feed_dots)),
-            )
+    /// Renders the actual composited-and-dithered raster at 1x (true
+    /// print size — a sliver, since the tape is only ~4mm tall), so
+    /// dithering can be judged before committing it to tape. Reads from
+    /// `preview_cache`; call `maybe_recompute_preview` first to keep it
+    /// current.
+    fn render_dither_preview(&self, _cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let png_1x = self.preview_cache.clone()?;
+
+        Some(
+            v_flex()
+                .gap_2()
+                .p_3()
+                .bg(gpui::rgb(0xfafafa))
+                .border_t_1()
+                .border_color(gpui::rgb(0xe5e5e5))
+                .child(div().text_sm().text_color(gpui::rgb(0x888888)).child(
+                    "Actual print preview (dithered, true size, true orientation)",
+                ))
+                .child(
+                    div()
+                        .border_1()
+                        .border_color(gpui::rgb(0xdddddd))
+                        .bg(gpui::white())
+                        .child(gpui_kit::img(png_1x).object_fit(ObjectFit::Contain)),
+                ),
+        )
     }
 }
 
 impl Render for LabelApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.maybe_recompute_preview(cx);
         h_flex()
             .size_full()
             .child(self.render_sidebar(cx))
@@ -969,31 +1064,10 @@ impl Render for LabelApp {
                 v_flex()
                     .flex_1()
                     .h_full()
-                    .child(
-                        TabBar::new("tabs")
-                            .selected_index(self.active_tab)
-                            .on_click(cx.listener(|this, index, _, cx| {
-                                this.active_tab = *index;
-                                this.rebuild_preview(cx);
-                            }))
-                            .child(Tab::new().label("Text"))
-                            .child(Tab::new().label("Image"))
-                            .child(Tab::new().label("Builder")),
-                    )
-                    .child(
-                        v_flex()
-                            .p_4()
-                            .gap_3()
-                            .child(match self.active_tab {
-                                0 => self.render_text_tab(cx).into_any_element(),
-                                1 => self.render_image_tab(cx).into_any_element(),
-                                _ => self.render_builder_tab(cx).into_any_element(),
-                            })
-                            .when(self.active_tab != 2, |flex| {
-                                flex.child(self.render_shared_controls(cx))
-                            }),
-                    )
-                    .when(self.active_tab != 2, |flex| flex.child(self.render_preview(cx)))
+                    .child(self.render_toolbar(cx))
+                    .children(self.render_property_panel(cx))
+                    .child(self.render_canvas(cx))
+                    .children(self.render_dither_preview(cx))
                     .child(
                         h_flex()
                             .p_3()

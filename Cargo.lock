@@ -3692,6 +3692,8 @@ dependencies = [
  "label-core",
  "label-device",
  "label-render",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -3717,6 +3719,7 @@ dependencies = [
  "image",
  "imageproc",
  "label-core",
+ "serde",
  "thiserror 2.0.21",
 ]
 
