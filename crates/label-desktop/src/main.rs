@@ -16,6 +16,25 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("failed to start Tokio runtime"))
 }
 
+/// Matches the LT200B and its siblings by advertised name — "Letratag
+/// DC067557FF1E" and similar, loosely, so any Dymo/LetraTag/generic
+/// "label" printer that shows up still gets recognized.
+fn is_compatible_printer_name(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("letra") || n.contains("dymo") || n.contains("label")
+}
+
+fn dymo_icon_image() -> Arc<gpui_kit::Image> {
+    static ICON: OnceLock<Arc<gpui_kit::Image>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        Arc::new(gpui_kit::Image::from_bytes(
+            gpui_kit::ImageFormat::Png,
+            include_bytes!("../assets/dymo-letratag.png").to_vec(),
+        ))
+    })
+    .clone()
+}
+
 use gpui_kit::component::button::*;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
@@ -74,6 +93,11 @@ struct LabelApp {
     found: Vec<label_device::DiscoveredPrinter>,
     device_id: Option<String>,
     device_name: Option<String>,
+    other_devices_expanded: bool,
+    /// GPUI dispatches key events to whatever has focus, not just "the
+    /// root" — this is what `on_key_down` on the root div actually needs
+    /// in order to receive Delete/Backspace at all.
+    focus_handle: gpui_kit::FocusHandle,
 
     // whole-document render options
     contrast: Entity<SliderState>,
@@ -115,6 +139,7 @@ struct LabelApp {
 
 impl LabelApp {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus_handle = cx.focus_handle();
         let contrast = cx.new(|_| {
             SliderState::new().min(-100.0).max(100.0).default_value(0.0).step(1.0)
         });
@@ -157,6 +182,8 @@ impl LabelApp {
             found: Vec::new(),
             device_id: None,
             device_name: None,
+            other_devices_expanded: false,
+            focus_handle,
             contrast,
             invert: false,
             copies: 1,
@@ -236,6 +263,14 @@ impl LabelApp {
                         this.scanning = false;
                         if let Some(found) = found {
                             this.found = found;
+                            let compatible = this
+                                .found
+                                .iter()
+                                .find(|d| d.name.as_deref().is_some_and(is_compatible_printer_name))
+                                .map(|d| (d.id.clone(), d.name.clone()));
+                            if let Some((id, name)) = compatible {
+                                this.select_device(id, name, cx);
+                            }
                         }
                         cx.notify();
                     })
@@ -260,6 +295,10 @@ impl LabelApp {
 
     fn select_element(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         self.builder_selected = Some(id);
+        // Selecting an element (a plain click on a div) doesn't itself
+        // grant keyboard focus; without this, Delete/Backspace on the
+        // root's on_key_down never fires because nothing holds focus.
+        window.focus(&self.focus_handle, cx);
         if let Some(el) = self.builder_elements.iter().find(|e| e.id == id) {
             match &el.kind {
                 BuilderKind::Text { text, size, bold } => {
@@ -615,6 +654,11 @@ impl LabelApp {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (compatible, other): (Vec<_>, Vec<_>) = self
+            .found
+            .iter()
+            .partition(|d| d.name.as_deref().is_some_and(is_compatible_printer_name));
+
         v_flex()
             .w(px(240.))
             .h_full()
@@ -634,18 +678,28 @@ impl LabelApp {
                     .gap_1()
                     .flex_1()
                     .overflow_y_scrollbar()
-                    .children(self.found.iter().map(|d| {
-                        let id = d.id.clone();
-                        let name = d.name.clone();
-                        let label = name.clone().unwrap_or_else(|| id.clone());
-                        let selected = self.device_id.as_deref() == Some(id.as_str());
-                        Button::new(SharedString::from(id.clone()))
-                            .label(label)
-                            .when(selected, |b| b.primary())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_device(id.clone(), name.clone(), cx)
-                            }))
-                    })),
+                    .children(compatible.iter().map(|d| self.render_device_row(d, true, cx)))
+                    .when(!other.is_empty(), |flex| {
+                        flex.child(
+                            div()
+                                .id("toggle-other-devices")
+                                .text_sm()
+                                .text_color(gpui::rgb(0x888888))
+                                .mt_2()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.other_devices_expanded = !this.other_devices_expanded;
+                                    cx.notify();
+                                }))
+                                .child(format!(
+                                    "{} Other devices ({})",
+                                    if self.other_devices_expanded { "▾" } else { "▸" },
+                                    other.len()
+                                )),
+                        )
+                        .when(self.other_devices_expanded, |flex| {
+                            flex.children(other.iter().map(|d| self.render_device_row(d, false, cx)))
+                        })
+                    }),
             )
             .child(
                 div()
@@ -656,6 +710,32 @@ impl LabelApp {
                         None => "No printer selected".into(),
                     }),
             )
+    }
+
+    fn render_device_row(
+        &self,
+        dev: &label_device::DiscoveredPrinter,
+        show_icon: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let id = dev.id.clone();
+        let name = dev.name.clone();
+        let label = name.clone().unwrap_or_else(|| id.clone());
+        let selected = self.device_id.as_deref() == Some(id.as_str());
+
+        h_flex()
+            .id(SharedString::from(format!("dev-{}", dev.id)))
+            .gap_2()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .when(selected, |d| d.bg(gpui::rgb(0xdbeafe)))
+            .on_click(cx.listener(move |this, _, _, cx| this.select_device(id.clone(), name.clone(), cx)))
+            .when(show_icon, |d| {
+                d.child(gpui_kit::img(dymo_icon_image()).w(px(28.)).h(px(28.)).object_fit(ObjectFit::Contain))
+            })
+            .child(div().text_sm().child(label))
     }
 
     fn render_builder_element(&self, el: &BuilderElement, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1159,6 +1239,15 @@ impl Render for LabelApp {
         self.maybe_recompute_preview(window, cx);
         h_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _window, cx| {
+                // A focused text input consumes backspace/delete itself
+                // (and stops propagation), so this only fires when
+                // nothing is being typed into.
+                if matches!(event.keystroke.key.as_str(), "backspace" | "delete") {
+                    this.remove_selected_element(cx);
+                }
+            }))
             .child(self.render_sidebar(cx))
             .child(
                 v_flex()
