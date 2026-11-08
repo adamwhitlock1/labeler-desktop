@@ -20,6 +20,15 @@ pub fn icon_names() -> Vec<String> {
     names
 }
 
+/// Raw SVG bytes for `name`, straight out of the embedded binary — for
+/// drawing an icon in the UI itself (toolbar buttons, the icon picker's own
+/// search results). Unlike [`icon_cache_path`], this never touches disk:
+/// there's no need for a stable file path when the icon is only ever handed
+/// to GPUI's own SVG renderer, not stored as an element on the label.
+pub fn icon_bytes(name: &str) -> Option<std::borrow::Cow<'static, [u8]>> {
+    IconAssets::get(&format!("{name}.svg")).map(|f| f.data)
+}
+
 /// Extracts `name`'s SVG to a stable cache file on disk (writing it only
 /// once) and returns that path, ready to use as an
 /// [`label_render::document::ElementKind::Image`] path like any other

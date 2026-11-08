@@ -24,6 +24,162 @@ fn is_compatible_printer_name(name: &str) -> bool {
     n.contains("letra") || n.contains("dymo") || n.contains("label")
 }
 
+/// Neutral chrome with a blue accent and pill-shaped controls, in both a
+/// dark and a light variant — see the "Studio" mockup this was designed
+/// from. Partial configs: any color one of these doesn't set falls back to
+/// gpui-component's own light/dark defaults for its mode.
+const STUDIO_DARK_THEME_JSON: &str = r##"{
+    "name": "Studio Dark",
+    "mode": "dark",
+    "radius": 999,
+    "radius.lg": 12,
+    "colors": {
+        "background": "#1a1b1f",
+        "foreground": "#e5e6ea",
+        "border": "#2c2e34",
+        "input.border": "#34363d",
+        "ring": "#3b82f6",
+        "caret": "#e5e6ea",
+        "muted.background": "#232428",
+        "muted.foreground": "#8a8f99",
+        "accent.background": "#26282e",
+        "accent.foreground": "#e5e6ea",
+        "primary.background": "#3b82f6",
+        "primary.foreground": "#ffffff",
+        "primary.hover.background": "#2f6fe0",
+        "primary.active.background": "#2a5fc4",
+        "secondary.background": "#2a2c31",
+        "secondary.hover.background": "#33353b",
+        "secondary.active.background": "#3b3d44",
+        "secondary.foreground": "#e5e6ea",
+        "popover.background": "#1f2024",
+        "popover.foreground": "#e5e6ea",
+        "list.background": "#1a1b1f",
+        "list.hover.background": "#232428",
+        "list.active.background": "#1f2d42",
+        "list.active.border": "#3b82f6",
+        "list.even.background": "#1d1e22",
+        "list.head.background": "#1d1e22",
+        "sidebar.background": "#18191c",
+        "sidebar.foreground": "#d8d9dd",
+        "sidebar.border": "#2a2c31",
+        "sidebar.accent.background": "#232428",
+        "sidebar.accent.foreground": "#e5e6ea",
+        "sidebar.primary.background": "#3b82f6",
+        "scrollbar.thumb.background": "#4a4d55cc",
+        "scrollbar.thumb.hover.background": "#5a5d66",
+        "selection.background": "#3b82f6"
+    }
+}"##;
+
+/// Light counterpart of [`STUDIO_DARK_THEME_JSON`] — same shapes and the
+/// same blue accent, mirrored onto a light neutral chrome.
+const STUDIO_LIGHT_THEME_JSON: &str = r##"{
+    "name": "Studio Light",
+    "mode": "light",
+    "radius": 999,
+    "radius.lg": 12,
+    "colors": {
+        "background": "#ffffff",
+        "foreground": "#1a1b1f",
+        "border": "#e4e5e9",
+        "input.border": "#d8d9de",
+        "ring": "#3b82f6",
+        "caret": "#1a1b1f",
+        "muted.background": "#f3f4f6",
+        "muted.foreground": "#6b7280",
+        "accent.background": "#eef2ff",
+        "accent.foreground": "#1a1b1f",
+        "primary.background": "#3b82f6",
+        "primary.foreground": "#ffffff",
+        "primary.hover.background": "#2f6fe0",
+        "primary.active.background": "#2a5fc4",
+        "secondary.background": "#f0f1f3",
+        "secondary.hover.background": "#e6e7ea",
+        "secondary.active.background": "#dddfe3",
+        "secondary.foreground": "#1a1b1f",
+        "popover.background": "#ffffff",
+        "popover.foreground": "#1a1b1f",
+        "list.background": "#ffffff",
+        "list.hover.background": "#f3f4f6",
+        "list.active.background": "#e9eefb",
+        "list.active.border": "#3b82f6",
+        "list.even.background": "#fafafa",
+        "list.head.background": "#fafafa",
+        "sidebar.background": "#f6f7f9",
+        "sidebar.foreground": "#2a2c31",
+        "sidebar.border": "#e4e5e9",
+        "sidebar.accent.background": "#eceef1",
+        "sidebar.accent.foreground": "#1a1b1f",
+        "sidebar.primary.background": "#3b82f6",
+        "scrollbar.thumb.background": "#c6c8cdcc",
+        "scrollbar.thumb.hover.background": "#aeb0b6",
+        "selection.background": "#3b82f6"
+    }
+}"##;
+
+/// Chrome colors for the app's own hand-built panels (toolbar, sidebar,
+/// property panel) that sit outside the themed component library and so
+/// aren't touched by the theme configs above — kept in step with them by
+/// hand, one [`Palette`] per mode.
+mod studio {
+    pub struct Palette {
+        pub border: u32,
+        pub panel_bg: u32,
+        /// Toolbar/sidebar chrome.
+        pub chrome_bg: u32,
+        /// A chrome panel with a faint blue cast, for rows tied to the
+        /// selected element (the property panel, the icon picker).
+        pub accent_panel_bg: u32,
+        pub text_dim: u32,
+        pub text_muted: u32,
+        /// Matches `colors.primary.background` in the matching theme JSON.
+        pub accent: u32,
+        pub selected_row_bg: u32,
+        /// The canvas pane surrounding the (always-light) tape itself.
+        pub canvas_bg: u32,
+    }
+
+    pub const DARK: Palette = Palette {
+        border: 0x2c2e34,
+        panel_bg: 0x1d1e22,
+        chrome_bg: 0x1a1b1f,
+        accent_panel_bg: 0x1a2230,
+        text_dim: 0x9499a3,
+        text_muted: 0x6b707a,
+        accent: 0x3b82f6,
+        selected_row_bg: 0x1f2d42,
+        canvas_bg: 0x26282d,
+    };
+
+    pub const LIGHT: Palette = Palette {
+        border: 0xe4e5e9,
+        panel_bg: 0xeef0f3,
+        chrome_bg: 0xf6f7f9,
+        accent_panel_bg: 0xe9eefb,
+        text_dim: 0x5b5f68,
+        text_muted: 0x8a8f99,
+        accent: 0x3b82f6,
+        selected_row_bg: 0xdbe6fb,
+        canvas_bg: 0xeef0f3,
+    };
+}
+
+fn apply_studio_theme(dark: bool, cx: &mut App) {
+    let json = if dark { STUDIO_DARK_THEME_JSON } else { STUDIO_LIGHT_THEME_JSON };
+    let config: ThemeConfig = serde_json::from_str(json).expect("STUDIO theme JSON must be valid");
+    let config = Rc::new(config);
+    Theme::update(cx, |theme| theme.apply_config(&config));
+}
+
+/// A bundled Heroicon, ready for `Button::icon` — pulled straight from the
+/// embedded SVG bytes rather than a registered asset path, since these are
+/// drawn directly rather than inserted onto a label.
+fn heroicon(name: &str) -> Icon {
+    let bytes = icons::icon_bytes(name).unwrap_or_default();
+    Icon::default().data(&bytes)
+}
+
 fn dymo_icon_image() -> Arc<gpui_kit::Image> {
     static ICON: OnceLock<Arc<gpui_kit::Image>> = OnceLock::new();
     ICON.get_or_init(|| {
@@ -99,6 +255,13 @@ struct SavedLabel {
 
 
 struct LabelApp {
+    /// Mirrors the mode of whichever Studio theme config is currently
+    /// applied to the global `Theme` — kept here too because the app's own
+    /// hand-built panels (toolbar, sidebar, ...) pick their colors off
+    /// `self.palette()` rather than the theme, so they need to know which
+    /// half of it to use.
+    dark_mode: bool,
+
     // device
     scanning: bool,
     found: Vec<label_device::DiscoveredPrinter>,
@@ -113,7 +276,6 @@ struct LabelApp {
     // whole-document render options
     contrast: Entity<SliderState>,
     invert: bool,
-    copies: u32,
     printing: bool,
 
     // builder
@@ -204,6 +366,7 @@ impl LabelApp {
         }));
 
         Self {
+            dark_mode: true,
             scanning: false,
             found: Vec::new(),
             device_id: None,
@@ -212,7 +375,6 @@ impl LabelApp {
             focus_handle,
             contrast,
             invert: false,
-            copies: 1,
             printing: false,
             builder_elements: Vec::new(),
             builder_selected: None,
@@ -235,6 +397,16 @@ impl LabelApp {
             preview_catchup_scheduled: false,
             _subscriptions: subs,
         }
+    }
+
+    fn palette(&self) -> &'static studio::Palette {
+        if self.dark_mode { &studio::DARK } else { &studio::LIGHT }
+    }
+
+    fn toggle_theme(&mut self, cx: &mut Context<Self>) {
+        self.dark_mode = !self.dark_mode;
+        apply_studio_theme(self.dark_mode, cx);
+        cx.notify();
     }
 
     fn render_opts(&self, cx: &App) -> RenderOptions {
@@ -707,7 +879,6 @@ impl LabelApp {
             window.push_notification((NotificationType::Warning, "Nothing to print."), cx);
             return;
         };
-        let copies = self.copies.max(1);
         self.printing = true;
         cx.notify();
 
@@ -717,9 +888,7 @@ impl LabelApp {
                     let printer = label_device::Printer::connect(&device_id)
                         .await
                         .map_err(|e| e.to_string())?;
-                    for _ in 0..copies {
-                        printer.print_job(&job).await.map_err(|e| e.to_string())?;
-                    }
+                    printer.print_job(&job).await.map_err(|e| e.to_string())?;
                     printer.disconnect().await.ok();
                     Ok(())
                 })
@@ -760,14 +929,26 @@ impl LabelApp {
             .h_full()
             .p_3()
             .gap_3()
+            .bg(gpui::rgb(self.palette().chrome_bg))
             .border_r_1()
-            .border_color(gpui::rgb(0xe5e5e5))
+            .border_color(gpui::rgb(self.palette().border))
             .child(
-                Button::new("scan")
-                    .primary()
-                    .label(if self.scanning { "Scanning..." } else { "Scan for Printers" })
-                    .disabled(self.scanning)
-                    .on_click(cx.listener(|this, _, window, cx| this.start_scan(window, cx))),
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("scan")
+                            .primary()
+                            .flex_1()
+                            .label(if self.scanning { "Scanning..." } else { "Scan for Printers" })
+                            .disabled(self.scanning)
+                            .on_click(cx.listener(|this, _, window, cx| this.start_scan(window, cx))),
+                    )
+                    .child(
+                        Button::new("toggle-theme")
+                            .icon(heroicon(if self.dark_mode { "sun" } else { "moon" }))
+                            .tooltip(if self.dark_mode { "Switch to light theme" } else { "Switch to dark theme" })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                    ),
             )
             .child(
                 v_flex()
@@ -780,7 +961,7 @@ impl LabelApp {
                             div()
                                 .id("toggle-other-devices")
                                 .text_sm()
-                                .text_color(gpui::rgb(0x888888))
+                                .text_color(gpui::rgb(self.palette().text_dim))
                                 .mt_2()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.other_devices_expanded = !this.other_devices_expanded;
@@ -800,7 +981,7 @@ impl LabelApp {
             .child(
                 div()
                     .text_sm()
-                    .text_color(gpui::rgb(0x666666))
+                    .text_color(gpui::rgb(self.palette().text_muted))
                     .child(match &self.device_name {
                         Some(n) => format!("Selected: {n}"),
                         None => "No printer selected".into(),
@@ -825,8 +1006,8 @@ impl LabelApp {
             .items_center()
             .px_2()
             .py_1()
-            .rounded_md()
-            .when(selected, |d| d.bg(gpui::rgb(0xdbeafe)))
+            .rounded_full()
+            .when(selected, |d| d.bg(gpui::rgb(self.palette().selected_row_bg)))
             .on_click(cx.listener(move |this, _, _, cx| this.select_device(id.clone(), name.clone(), cx)))
             .when(show_icon, |d| {
                 d.child(gpui_kit::img(dymo_icon_image()).w(px(28.)).h(px(28.)).object_fit(ObjectFit::Contain))
@@ -841,6 +1022,12 @@ impl LabelApp {
 
         let content: AnyElement = match &el.kind {
             BuilderKind::Text { text, size, bold, font_path } => div()
+                // The canvas represents ink on tape, not themed UI text —
+                // it has to stay black regardless of app theme/mode, same
+                // as the shapes below, or it inherits the (light, in the
+                // Studio dark theme) default foreground and all but
+                // vanishes against the white tape.
+                .text_color(gpui::black())
                 .text_size(px(*size * PREVIEW_SCALE))
                 // Tight, 1:1 line height: GPUI's default leading made the
                 // element's bounding box noticeably taller than the glyphs
@@ -899,6 +1086,7 @@ impl LabelApp {
                         .flex()
                         .items_center()
                         .justify_center()
+                        .text_color(gpui::black())
                         .text_size(px(s))
                         .line_height(px(s))
                         .child(match style {
@@ -917,7 +1105,7 @@ impl LabelApp {
             .left(px(el.x))
             .top(px(el.y))
             .when(selected, |d| {
-                d.border_1().border_color(gpui::rgb(0x3b82f6)).p(px(1.))
+                d.border_1().border_color(gpui::rgb(self.palette().accent)).p(px(1.))
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.select_element(id, window, cx);
@@ -935,19 +1123,13 @@ impl LabelApp {
     }
 
     /// A visually distinct card grouping a few related toolbar controls,
-    /// each wrapped in its own small bordered chip — without this, e.g.
-    /// the length input and the "dots" label next to it read as one
-    /// control instead of two.
+    /// each wrapped in its own small pill chip — without this, e.g. the
+    /// length input and the "dots" label next to it read as one control
+    /// instead of two. A flat fill (no border) reads as grouping without
+    /// adding more hairlines to an already border-heavy toolbar.
     fn toolbar_group(&self, children: impl IntoIterator<Item = AnyElement>) -> impl IntoElement {
         h_flex().gap_1().items_center().children(children.into_iter().map(|child| {
-            div()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .border_color(gpui::rgb(0xe0e0e0))
-                .bg(gpui::rgb(0xf7f7f7))
-                .child(child)
+            div().px_2().py_1().rounded_full().bg(gpui::rgb(self.palette().panel_bg)).child(child)
         }))
     }
 
@@ -957,36 +1139,39 @@ impl LabelApp {
             .items_center()
             .child(
                 Button::new("add-text")
-                    .label("T  Text")
-                    .small()
+                    .icon(heroicon("document-text"))
+                    .label("Text")
                     .on_click(cx.listener(|this, _, window, cx| this.add_text_element(window, cx))),
             )
             .child(
                 Button::new("add-image")
-                    .label("🖼 Image")
-                    .small()
+                    .icon(heroicon("photo"))
+                    .label("Image")
                     .on_click(cx.listener(|this, _, window, cx| this.add_image_element(window, cx))),
             )
-            .child(Button::new("add-circle").label("○").small().on_click(cx.listener(
+            // These three stay literal shape glyphs rather than icons —
+            // they're previews of the shape each button inserts, not
+            // symbols standing in for an action.
+            .child(Button::new("add-circle").label("○").on_click(cx.listener(
                 |this, _, window, cx| this.add_shape_element(ShapeKind::Circle, window, cx),
             )))
-            .child(Button::new("add-square").label("□").small().on_click(cx.listener(
+            .child(Button::new("add-square").label("□").on_click(cx.listener(
                 |this, _, window, cx| this.add_shape_element(ShapeKind::Square, window, cx),
             )))
-            .child(Button::new("add-triangle").label("△").small().on_click(cx.listener(
+            .child(Button::new("add-triangle").label("△").on_click(cx.listener(
                 |this, _, window, cx| this.add_shape_element(ShapeKind::Triangle, window, cx),
             )))
             .child(
                 Button::new("add-icon")
-                    .label("✦ Icon")
-                    .small()
+                    .icon(heroicon("sparkles"))
+                    .label("Icon")
                     .when(self.icon_picker_open, |b| b.primary())
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_icon_picker(cx))),
             )
             .child(
                 Button::new("remove")
-                    .label("🗑")
-                    .small()
+                    .icon(heroicon("trash"))
+                    .tooltip("Remove")
                     .disabled(self.builder_selected.is_none())
                     .on_click(cx.listener(|this, _, _, cx| this.remove_selected_element(cx))),
             )
@@ -1009,7 +1194,7 @@ impl LabelApp {
                         }))
                         .child(Input::new(&self.builder_feed_input)),
                 )
-                .child(div().text_sm().text_color(gpui::rgb(0x666666)).ml_1().child("dots"))
+                .child(div().text_sm().text_color(gpui::rgb(self.palette().text_muted)).ml_1().child("dots"))
                 .into_any_element(),
             h_flex()
                 .gap_1()
@@ -1035,14 +1220,14 @@ impl LabelApp {
             .items_center()
             .child(
                 Button::new("save")
-                    .label("💾 Save")
-                    .small()
+                    .icon(heroicon("arrow-down-on-square"))
+                    .label("Save")
                     .on_click(cx.listener(|this, _, window, cx| this.save_label(window, cx))),
             )
             .child(
                 Button::new("open")
-                    .label("📂 Open")
-                    .small()
+                    .icon(heroicon("folder-open"))
+                    .label("Open")
                     .on_click(cx.listener(|this, _, window, cx| this.load_label(window, cx))),
             )
             .into_any_element()]);
@@ -1050,12 +1235,10 @@ impl LabelApp {
         v_flex()
             .gap_2()
             .p_3()
-            .bg(gpui::rgb(0xfafafa))
-            .border_b_1()
-            .border_color(gpui::rgb(0xe5e5e5))
+            .bg(gpui::rgb(self.palette().chrome_bg))
             .child(h_flex().gap_3().items_center().child(insert_group).child(document_group).child(file_group))
             .child(
-                div().text_sm().text_color(gpui::rgb(0x999999)).child(format!(
+                div().text_sm().text_color(gpui::rgb(self.palette().text_dim)).child(format!(
                     "Editor is zoomed in {PREVIEW_SCALE:.0}x — printable area is about {:.0}mm long x {:.0}mm tall, plus a ~10mm blank leader/trailer the printer adds to every job",
                     self.builder_feed_dots as f32 / CROSS_DOTS_PER_MM,
                     PRINT_HEAD_DOTS as f32 / CROSS_DOTS_PER_MM,
@@ -1078,16 +1261,17 @@ impl LabelApp {
             v_flex()
                 .gap_2()
                 .p_3()
-                .bg(gpui::rgb(0xfafaff))
+                .bg(gpui::rgb(self.palette().accent_panel_bg))
                 .border_b_1()
-                .border_color(gpui::rgb(0xe0e5f5))
+                .border_color(gpui::rgb(self.palette().border))
                 .child(div().w(px(240.)).child(Input::new(&self.icon_search).cleanable(true)))
                 .child(
                     h_flex().flex_wrap().gap_1().children(matches.into_iter().map(|name| {
                         let label = name.clone();
                         Button::new(SharedString::from(format!("icon-{name}")))
+                            .icon(heroicon(&name))
                             .label(label)
-                            .xsmall()
+                            .small()
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.add_icon_element(&name, window, cx)
                             }))
@@ -1104,9 +1288,9 @@ impl LabelApp {
                 .items_center()
                 .px_3()
                 .py_2()
-                .bg(gpui::rgb(0xeef2ff))
+                .bg(gpui::rgb(self.palette().accent_panel_bg))
                 .border_b_1()
-                .border_color(gpui::rgb(0xe0e5f5))
+                .border_color(gpui::rgb(self.palette().border))
                 .when(matches!(el.kind, BuilderKind::Text { .. }), |row| {
                     row.child(div().w(px(200.)).child(Input::new(&self.builder_text_edit)))
                         .child(div().w(px(160.)).child(Select::new(&self.builder_font_select).placeholder("Font")))
@@ -1166,7 +1350,6 @@ impl LabelApp {
                 .child(
                     Button::new("center-v")
                         .label("Center Vertically")
-                        .small()
                         .on_click(cx.listener(|this, _, _, cx| this.center_selected_vertically(cx))),
                 ),
         )
@@ -1190,7 +1373,7 @@ impl LabelApp {
             .flex_1()
             .w_full()
             .p_6()
-            .bg(gpui::rgb(0xf5f5f7))
+            .bg(gpui::rgb(self.palette().canvas_bg))
             .overflow_x_scrollbar()
             .child(
                 div()
@@ -1323,8 +1506,8 @@ impl LabelApp {
                 .p_3()
                 .items_start()
                 .border_t_1()
-                .border_color(gpui::rgb(0xe5e5e5))
-                .child(div().text_sm().text_color(gpui::rgb(0x888888)).child(
+                .border_color(gpui::rgb(self.palette().border))
+                .child(div().text_sm().text_color(gpui::rgb(self.palette().text_dim)).child(
                     "Approximate print preview",
                 ))
                 .child(
@@ -1335,7 +1518,7 @@ impl LabelApp {
                     // regardless of how short the actual label is.
                     div()
                         .border_1()
-                        .border_color(gpui::rgb(0x999999))
+                        .border_color(gpui::rgb(self.palette().text_muted))
                         .border_dashed()
                         .child(gpui_kit::img(png)),
                 ),
@@ -1382,24 +1565,7 @@ impl Render for LabelApp {
                             .items_center()
                             .justify_end()
                             .border_t_1()
-                            .border_color(gpui::rgb(0xe5e5e5))
-                            .child(
-                                Button::new("minus")
-                                    .label("-")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.copies = this.copies.saturating_sub(1).max(1);
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(div().w(px(30.)).child(format!("{}", self.copies)))
-                            .child(
-                                Button::new("plus")
-                                    .label("+")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.copies += 1;
-                                        cx.notify();
-                                    })),
-                            )
+                            .border_color(gpui::rgb(self.palette().border))
                             .child(
                                 Button::new("print")
                                     .primary()
@@ -1413,16 +1579,29 @@ impl Render for LabelApp {
 }
 
 fn main() {
-    application().with_assets(assets::Assets).run(|cx| {
-        gpui_kit::init(cx);
-        // Default scrollbar behavior only draws the thumb on hover/scroll;
-        // the canvas's horizontal scrollbar should stay visible once the
-        // label is wider than the viewport so its existence (and current
-        // position) is obvious without having to interact first.
-        Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
-        open_window(WindowOptions::default(), cx, |window, cx| {
-            cx.new(|cx| LabelApp::new(window, cx))
-        })
-        .expect("Failed to open window");
+    let app = application().with_assets(assets::Assets);
+    // macOS keeps the app (and its dock icon) running after its last
+    // window closes, but doesn't reopen one on its own — without this,
+    // clicking the dock icon again did nothing.
+    app.on_reopen(|cx| {
+        if cx.windows().is_empty() {
+            open_main_window(cx);
+        }
     });
+    app.run(|cx| {
+            gpui_kit::init(cx);
+            apply_studio_theme(true, cx);
+            // Default scrollbar behavior only draws the thumb on
+            // hover/scroll; the canvas's horizontal scrollbar should stay
+            // visible once the label is wider than the viewport so its
+            // existence (and current position) is obvious without having
+            // to interact first.
+            Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
+            open_main_window(cx);
+        });
+}
+
+fn open_main_window(cx: &mut App) {
+    open_window(WindowOptions::default(), cx, |window, cx| cx.new(|cx| LabelApp::new(window, cx)))
+        .expect("Failed to open window");
 }
