@@ -139,11 +139,6 @@ struct LabelApp {
     canvas_origin: Rc<Cell<Point<Pixels>>>,
     /// (element id, grab offset within the element, in canvas-local px)
     drag_grab: Option<(u64, f32, f32)>,
-    /// Horizontal pan offset of the canvas viewport, in preview px. Driven
-    /// by `on_scroll_wheel` directly — the library's `overflow_x_scrollbar`
-    /// never actually scrolled here (nested every way tried), so this
-    /// panning is self-managed instead of relying on it.
-    builder_scroll_x: f32,
     /// Cached (1x, 3x) dithered print preview, refreshed by
     /// `maybe_recompute_preview` on a throttle instead of every render —
     /// the full raster/dither pass is expensive enough (font shaping,
@@ -235,7 +230,6 @@ impl LabelApp {
             loaded_fonts: std::collections::HashSet::new(),
             canvas_origin: Rc::new(Cell::new(Point::default())),
             drag_grab: None,
-            builder_scroll_x: 0.0,
             preview_cache: None,
             last_preview_compute: std::time::Instant::now() - std::time::Duration::from_secs(1),
             preview_catchup_scheduled: false,
@@ -418,6 +412,26 @@ impl LabelApp {
             }
             self.loaded_fonts.insert(path);
         }
+    }
+
+    /// Re-scans installed system fonts so a font installed after the app
+    /// launched (e.g. dropped into `~/Library/Fonts` while running) shows
+    /// up without restarting — `fontdb`'s scan only happens when asked.
+    fn refresh_fonts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.builder_font_choices = available_fonts();
+        let font_options = SearchableVec::new(
+            std::iter::once("Default".to_string())
+                .chain(self.builder_font_choices.iter().map(|f| f.family.clone()))
+                .collect::<Vec<_>>(),
+        );
+        let previous = self.builder_font_select.read(cx).selected_value().cloned();
+        self.builder_font_select.update(cx, |s, cx| {
+            s.set_items(font_options, window, cx);
+            if let Some(value) = previous {
+                s.set_selected_value(&value, window, cx);
+            }
+        });
+        cx.notify();
     }
 
     fn update_selected_font(&mut self, cx: &mut Context<Self>) {
@@ -1097,6 +1111,12 @@ impl LabelApp {
                     row.child(div().w(px(200.)).child(Input::new(&self.builder_text_edit)))
                         .child(div().w(px(160.)).child(Select::new(&self.builder_font_select).placeholder("Font")))
                         .child(
+                            Button::new("refresh-fonts")
+                                .label("Refresh fonts")
+                                .xsmall()
+                                .on_click(cx.listener(|this, _, window, cx| this.refresh_fonts(window, cx))),
+                        )
+                        .child(
                             h_flex()
                                 .gap_2()
                                 .items_center()
@@ -1156,32 +1176,26 @@ impl LabelApp {
         let canvas_w = self.builder_feed_dots as f32 * PREVIEW_SCALE;
         let canvas_h = PRINT_HEAD_DOTS as f32 * PREVIEW_SCALE;
         let origin_cell = self.canvas_origin.clone();
-        let scroll_x = self.builder_scroll_x;
 
+        // Previous attempts at `overflow_x_scrollbar()` never scrolled —
+        // but those nested it inside a separate `overflow_hidden()`
+        // wrapper, which fights the scroll area it manages itself. Per
+        // `ScrollableElement`'s own doc ("the wrapped element is the
+        // scroll area itself, rather than being inserted as a child of a
+        // new scroll area"), it has to be called directly on this div,
+        // which also needs a stable `.id()` for its scroll position to
+        // persist across renders.
         div()
+            .id("builder-canvas-scroll")
             .flex_1()
             .w_full()
-            .overflow_hidden()
             .p_6()
             .bg(gpui::rgb(0xf5f5f7))
-            // Self-managed horizontal pan: gpui-component's
-            // `overflow_x_scrollbar()` never actually scrolled here no
-            // matter how it was nested, so this drives the offset
-            // directly off wheel/trackpad events instead.
-            .on_scroll(cx.listener(
-                move |this, event: &gpui_kit::ScrollEvent, window, cx| {
-                    let delta = event.delta.pixel_delta(window.line_height());
-                    let raw = if f32::from(delta.x) != 0.0 { delta.x } else { delta.y };
-                    let canvas_w = this.builder_feed_dots as f32 * PREVIEW_SCALE;
-                    this.builder_scroll_x = (this.builder_scroll_x - f32::from(raw)).clamp(0.0, canvas_w);
-                    cx.notify();
-                },
-            ))
+            .overflow_x_scrollbar()
             .child(
                 div()
                     .id("builder-canvas")
                     .relative()
-                    .ml(px(-scroll_x))
                     .w(px(canvas_w))
                     .h(px(canvas_h))
                     .flex_shrink_0()
@@ -1348,6 +1362,13 @@ impl Render for LabelApp {
             .child(
                 v_flex()
                     .flex_1()
+                    // Without this, this column refuses to shrink below
+                    // the canvas's unclipped intrinsic width (a flex item
+                    // only drops that minimum when its own overflow isn't
+                    // Visible) — which silences the canvas's horizontal
+                    // scrollbar entirely, since nothing downstream of it
+                    // ever actually overflows its allocated space.
+                    .min_w_0()
                     .h_full()
                     .child(self.render_toolbar(cx))
                     .children(self.render_icon_picker(cx))
@@ -1394,6 +1415,11 @@ impl Render for LabelApp {
 fn main() {
     application().with_assets(assets::Assets).run(|cx| {
         gpui_kit::init(cx);
+        // Default scrollbar behavior only draws the thumb on hover/scroll;
+        // the canvas's horizontal scrollbar should stay visible once the
+        // label is wider than the viewport so its existence (and current
+        // position) is obvious without having to interact first.
+        Theme::set_scrollbar_mode(gpui_kit::component::scroll::ScrollbarMode::Always, cx);
         open_window(WindowOptions::default(), cx, |window, cx| {
             cx.new(|cx| LabelApp::new(window, cx))
         })

@@ -1,8 +1,8 @@
 //! Lists the system's installed fonts that our text pipeline can actually
-//! use. `ab_glyph` only parses plain TrueType glyf outlines from a single
-//! font file — not font collections (`.ttc`, common on macOS for things
-//! like Helvetica) and not CFF/PostScript outlines (common in `.otf`) —
-//! so this filters down to `.ttf` files with a regular (non-bold,
+//! use. `ab_glyph` parses both TrueType glyf outlines (`.ttf`) and
+//! CFF/PostScript outlines (`.otf`) from a single font file — just not font
+//! collections (`.ttc`, common on macOS for things like Helvetica) — so
+//! this filters down to `.ttf`/`.otf` files with a regular (non-bold,
 //! non-italic) face before offering a family as a choice.
 
 use std::collections::HashMap;
@@ -38,12 +38,12 @@ pub fn available_fonts() -> Vec<FontChoice> {
         let fontdb::Source::File(path) = &face.source else {
             continue;
         };
-        let is_ttf = path
+        let is_usable_format = path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("ttf"));
+            .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"));
         let is_regular = face.style == fontdb::Style::Normal && face.weight == fontdb::Weight::NORMAL;
-        if is_ttf && is_regular {
+        if is_usable_format && is_regular {
             by_family.entry(family.clone()).or_insert_with(|| path.clone());
         }
     }
