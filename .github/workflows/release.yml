@@ -1,0 +1,53 @@
+name: Build macOS app
+
+# Builds an unsigned, ad-hoc-codesigned LabelDesktop.app (same bundling
+# scripts/make_app_bundle.sh uses locally) and publishes it as a zip —
+# either as a workflow artifact for every run, or attached to a GitHub
+# Release when the run was triggered by a version tag.
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Build release binary
+        run: cargo build --release -p label-desktop
+
+      - name: Bundle app
+        run: ./scripts/make_app_bundle.sh label-desktop target/release/label-desktop LabelDesktop
+
+      - name: Zip app bundle
+        # ditto (not `zip`) preserves the bundle's resource forks/metadata,
+        # same as Finder's own "Compress" would.
+        run: ditto -c -k --sequesterRsrc --keepParent dist/LabelDesktop.app LabelDesktop-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LabelDesktop-macos
+          path: LabelDesktop-macos.zip
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LabelDesktop-macos.zip
+          generate_release_notes: true
+          body: |
+            Unsigned, ad-hoc-codesigned build — not notarized by Apple.
+            macOS will flag it as from an unidentified developer: right-click
+            the app and choose Open, or run `xattr -dr com.apple.quarantine
+            LabelDesktop.app` after unzipping.
